@@ -1,5 +1,5 @@
 import { constants, accessSync, statSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { delimiter, extname, isAbsolute, resolve } from 'node:path';
 import type { HostConfig } from '../config.ts';
 import { runCommand, type CommandOptions } from '../t3/pairing.ts';
 
@@ -22,9 +22,22 @@ function check(level: CommandCheck['level'], code: string, detail: string): Comm
   return { level, code, detail: `${code}: ${detail}` };
 }
 
-/** Match execFile's Unix lookup: explicit paths use cwd, otherwise PATH (or the OS default). */
+/**
+ * libuv's Windows lookup: the name as given only when it has an extension, then name.com and name.exe. Explicit paths
+ * use cwd, otherwise the cwd and then each PATH directory. A .cmd or .bat never resolves: execFile cannot run one.
+ */
+function windowsCandidates(file: string, env: NodeJS.ProcessEnv): string[] {
+  const names = [...(extname(file) ? [file] : []), `${file}.com`, `${file}.exe`];
+  if (isAbsolute(file) || /[\\/]/.test(file)) return names.map((name) => resolve(name));
+  const dirs = ['.', ...(env.PATH ?? env.Path ?? '').split(delimiter).filter(Boolean)];
+  return dirs.flatMap((dir) => names.map((name) => resolve(dir, name)));
+}
+
+/** Match execFile's lookup: explicit paths use cwd, otherwise PATH (or the OS default). */
 export function resolveCommand(file: string, env: NodeJS.ProcessEnv): { path: string | null; check: CommandCheck } {
-  const paths = file.includes('/') ? [resolve(file)] : (env.PATH ?? '/usr/bin:/bin').split(':').map((dir) => resolve(dir || '.', file));
+  const paths = process.platform === 'win32'
+    ? windowsCandidates(file, env)
+    : file.includes('/') ? [resolve(file)] : (env.PATH ?? '/usr/bin:/bin').split(':').map((dir) => resolve(dir || '.', file));
   let notExecutable = false;
   let unverified = false;
   for (const path of paths) {
@@ -53,7 +66,7 @@ export function resolveCommand(file: string, env: NodeJS.ProcessEnv): { path: st
 
 function pinned(path: string): boolean {
   // Inspect the selected path, not its realpath: a stable symlink may intentionally follow updates.
-  return /(?:^|\/)runtime\/versions\/[^/]+(?:\/|$)/.test(path);
+  return /(?:^|[\\/])runtime[\\/]versions[\\/][^\\/]+(?:[\\/]|$)/.test(path);
 }
 
 export function checkMintExecutable(host: HostConfig, env: NodeJS.ProcessEnv): CommandCheck[] {

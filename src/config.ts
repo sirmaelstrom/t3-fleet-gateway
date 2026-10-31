@@ -18,7 +18,11 @@ export function isLoopbackHostname(hostname: string): boolean {
   return LOOPBACK_HOSTNAMES.has(hostname);
 }
 
-const DEFAULT_MINT_COMMAND = ['t3', 'auth', 'pairing', 'create', '--ttl', '5m', '--json'];
+const MINT_ARGS = ['auth', 'pairing', 'create', '--ttl', '5m', '--json'];
+// On Windows the T3 installer's entrypoint is a .cmd shim, which execFile refuses to run without cmd.exe.
+const DEFAULT_MINT_COMMAND = process.platform === 'win32'
+  ? ['cmd.exe', '/d', '/c', join(homedir(), '.local', 'bin', 't3.cmd'), ...MINT_ARGS]
+  : ['t3', ...MINT_ARGS];
 
 const slug = (max: number) =>
   z

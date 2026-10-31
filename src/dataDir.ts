@@ -19,6 +19,9 @@ function assertPrivate(path: string, kind: 'directory' | 'file'): void {
   if (kind === 'directory' ? !stats.isDirectory() : !stats.isFile()) {
     throw new GatewayError('data_dir_insecure', `${path} is not a ${kind}`);
   }
+  // Windows has no POSIX mode bits (Node reports 666 for every file); the directory's access list is what keeps it
+  // private. Remove inheritance and grant only the owner: icacls <dir> /inheritance:r /grant:r <user>:(OI)(CI)F
+  if (process.platform === 'win32') return;
   if (typeof process.getuid === 'function' && stats.uid !== process.getuid()) {
     throw new GatewayError('data_dir_insecure', `${path} is owned by another user`);
   }
