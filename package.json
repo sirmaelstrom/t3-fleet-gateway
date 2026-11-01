@@ -14,7 +14,7 @@
   },
   "scripts": {
     "start": "node bin/t3-fleet-gateway.js serve",
-    "test": "node --test --test-timeout=30000 --test-reporter=spec \"test/**/*.test.ts\"",
+    "test": "node scripts/test-run.ts",
     "typecheck": "tsc --noEmit",
     "check": "npm run typecheck && npm test && npm run privacy:check",
     "privacy:check": "node scripts/privacy-check.ts",
