@@ -7,7 +7,7 @@ Guidance for coding agents working in this repository. The specification is [doc
 ```sh
 npm install          # dependencies (runtime: @modelcontextprotocol/server, @modelcontextprotocol/client, zod)
 npm run check        # tsc --noEmit + all tests + privacy check; must pass before every commit
-npm test             # node --test over test/**/*.test.ts (30 s per-test timeout)
+npm test             # node --test over test/**/*.test.ts (30 s per-test timeout) in a private temp dir; fails if the run leaves t3fg-* dirs (scripts/test-run.ts)
 npm run typecheck    # tsc --noEmit
 node --test test/oauth-token.test.ts   # one file
 node bin/t3-fleet-gateway.js --help    # CLI

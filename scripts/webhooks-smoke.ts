@@ -433,12 +433,16 @@ async function main() {
     return receipt;
   } finally {
     stage = stage === 'setup' ? 'cleanup' : stage;
-    await stop();
-    for (const socket of sockets) socket.destroy();
-    if (receiver) await new Promise<void>((resolve) => receiver!.close(() => resolve()));
-    if (door) await new Promise<void>((resolve) => door!.close(() => resolve()));
-    await fake?.close();
-    rmSync(temp, { recursive: true, force: true });
+    try {
+      await stop();
+      for (const socket of sockets) socket.destroy();
+      if (receiver) await new Promise<void>((resolve) => receiver!.close(() => resolve()));
+      if (door) await new Promise<void>((resolve) => door!.close(() => resolve()));
+      await fake?.close();
+    } finally {
+      // Removed on every exit path; a busy file (the killed gateway's SQLite files on Windows) is retried.
+      rmSync(temp, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    }
   }
 }
 

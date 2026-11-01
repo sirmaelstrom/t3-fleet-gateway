@@ -188,7 +188,6 @@ async function refresh(baseUrl: string, clientId: string, refreshToken: string):
 /** Start the fleet for `scenario`. Times are spread over the last hours by running the gateway on a clock that catches up. */
 export async function startDemoFleet(options: DemoOptions): Promise<DemoFleet> {
   const { scenario } = options;
-  const dataDir = mkdtempSync(join(tmpdir(), 't3fg-dashboard-demo-'));
   const fakes = {
     studio: await startFakeT3({ serverVersion: '0.9.4', projectCount: 4 }),
     forge: await startFakeT3({ serverVersion: '0.9.4', projectCount: 3 }),
@@ -225,23 +224,34 @@ export async function startDemoFleet(options: DemoOptions): Promise<DemoFleet> {
   });
   const logger = options.logger ?? silentLogger;
   // Client labels are set once the clients exist (ids are random); the config object is the gateway's own.
+  // A busy file (Windows keeps SQLite files locked until closed) is retried; the directory is removed on every exit path.
+  const dataDir = mkdtempSync(join(tmpdir(), 't3fg-dashboard-demo-'));
+  const removeDataDir = () => rmSync(dataDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   const gateway = await startGateway({
     reachability: { autoStart: false },
     config, dataDir, logger, clock, dashboardDemoLabel: options.badge === undefined ? 'Synthetic demo' : options.badge ?? undefined,
     port: 0, dashboardPort: options.dashboardPort ?? 0, jobEngine: { autoStart: false },
     webhookManagement: { loopbackOnly: true, ...(options.webhookReceiver ? { allowLoopbackHttp: true, attemptTimeoutMs: 1000 } : {}) },
+  }).catch(async (error: unknown) => {
+    removeDataDir();
+    await door.close().catch(() => {});
+    for (const fake of Object.values(fakes)) await fake.close().catch(() => {});
+    throw error;
   });
   door.forwardTo(gateway.port);
   const { services, engine } = gateway;
   const agents: Agent[] = [];
   let webhookReceiver: DemoWebhookReceiver | null = null;
   const close = async () => {
-    for (const agent of agents) await agent.close().catch(() => {});
-    await gateway.close();
-    await webhookReceiver?.close();
-    await door.close();
-    for (const fake of Object.values(fakes)) await fake.close();
-    rmSync(dataDir, { recursive: true, force: true });
+    try {
+      for (const agent of agents) await agent.close().catch(() => {});
+      await gateway.close();
+      await webhookReceiver?.close();
+      await door.close();
+      for (const fake of Object.values(fakes)) await fake.close();
+    } finally {
+      removeDataDir();
+    }
   };
   try {
     for (const id of ['studio', 'forge', 'lab']) await services.registry.enroll(id);
