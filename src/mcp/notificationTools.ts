@@ -23,11 +23,12 @@ export function notificationTools(services: GatewayServices): GatewayTool[] {
       outputSchema: z.object({ connections: z.array(z.object({
         id: z.string(), hosts: z.array(z.string()), projects: z.array(z.string()), jobs: z.array(z.string()),
         targets: z.array(z.object({ host: z.string(), projectId: z.string() })), events, health,
+        healthAvailable: z.boolean().describe('false: aggregate connection history is withheld under project restrictions; health counters are placeholders'),
         subscriptions: z.array(z.object({ jobId: z.string(), events })),
       })) }),
       async run(_input, caller) {
-        const connections = services.webhooks.ownedConnections(caller).map(({ id, hosts, projects, jobs, targets, events, health, subscriptions }) =>
-          ({ id, hosts, projects, jobs, targets, events, health, subscriptions }));
+        const connections = services.webhooks.ownedConnections(caller).map(({ id, hosts, projects, jobs, targets, events, health, healthAvailable, subscriptions }) =>
+          ({ id, hosts, projects, jobs, targets, events, health, healthAvailable, subscriptions }));
         return { structured: { connections }, summary: `${connections.length} notification connection(s) assigned to this client.` };
       },
     }),

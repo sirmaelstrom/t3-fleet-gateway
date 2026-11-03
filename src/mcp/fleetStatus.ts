@@ -132,7 +132,7 @@ export function fleetStatusTool(deps: { config: GatewayConfig; registry: HostReg
     async run(_input, context) {
       // Only the hosts this agent's grant lets it read are listed, counted and checked; their projects and standing jobs likewise.
       const visible = (hostId: string) => permits(context.scopes, 'read', hostId);
-      const counts = jobCountsByHost(deps.db);
+      const counts = jobCountsByHost(deps.db, deps.jobs.projectAccess(context));
       const hosts = await Promise.all(
         deps.config.hosts.filter((host) => visible(host.id)).map(async (host): Promise<HostStatus> => {
           const [health, credential] = [await deps.registry.health(host.id), deps.registry.credentialStatus(host.id)];
@@ -140,7 +140,8 @@ export function fleetStatusTool(deps: { config: GatewayConfig; registry: HostReg
           return {
             id: host.id,
             label: host.label ?? null,
-            defaultProject: host.defaultProject ?? null,
+            defaultProject: host.defaultProject && deps.jobs.allowsProject(context, host.id, host.defaultProject,
+              deps.config.projects.find((p) => p.alias === host.defaultProject)?.t3ProjectId) ? host.defaultProject : null,
             choosesWorkspace: host.workspaceProbeCommand !== undefined,
             reachable: health.reachable,
             t3Version: health.t3Version,
@@ -159,9 +160,11 @@ export function fleetStatusTool(deps: { config: GatewayConfig; registry: HostReg
           };
         }),
       );
-      const standing = deps.jobs.store.standingJobs().filter((job) =>
-        visible(job.hostId) && (job.origin !== 'adopted' || context.scopes.includes(THREAD_READ_SCOPE)));
-      const projects = deps.config.projects.filter((project) => visible(project.host)).map((project) => ({
+      const standing = deps.jobs.store.standingJobs(undefined, { projects: deps.jobs.projectAccess(context),
+        hostIds: deps.config.hosts.filter((host) => visible(host.id)).map((host) => host.id),
+        includeAdopted: context.scopes.includes(THREAD_READ_SCOPE) }).filter((job) =>
+        visible(job.hostId) && deps.jobs.allowsProject(context, job.hostId, job.projectAlias, job.t3ProjectId) && (job.origin !== 'adopted' || context.scopes.includes(THREAD_READ_SCOPE)));
+      const projects = deps.config.projects.filter((project) => visible(project.host) && deps.jobs.allowsProject(context, project.host, project.alias, project.t3ProjectId)).map((project) => ({
         alias: project.alias,
         description: project.description,
         host: project.host,

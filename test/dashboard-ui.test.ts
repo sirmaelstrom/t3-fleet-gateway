@@ -173,13 +173,13 @@ const WEBHOOK_URL = 'https://hooks.example.test/private-synthetic-route';
 const AUTH_HEADER = 'Authorization: Bearer synthetic-private-key';
 const webhookRow = (source: 'config' | 'dashboard' = 'dashboard') => ({
   id: source === 'dashboard' ? 'ui-connection' : 'file-connection', revision: 3, source, enabled: true,
-  projects: ['alpha'], hosts: ['h1'], lastTest: { at: NOW, outcome: 'delivered', statusCode: 202 },
+  displayName: 'alpha', projects: ['alpha'], hosts: ['h1'], lastTest: { at: NOW, outcome: 'delivered', statusCode: 202 },
 });
 type WebhookRow = ReturnType<typeof webhookRow>;
 
 async function webhookPage(options: {
   connections?: WebhookRow[];
-  projects?: { alias: string; host: string; projectId?: string; name?: string }[];
+  projects?: { alias: string; host: string; projectId?: string; name?: string; label: string }[];
   hosts?: { host: string; status: string }[];
   post?: (path: string, body: Record<string, unknown>) => Promise<Response> | Response;
 } = {}) {
@@ -199,7 +199,7 @@ async function webhookPage(options: {
     if (path === 'api/webhooks') {
       reads++;
       assert.equal(init.method ?? 'GET', 'GET');
-      return Response.json({ projects: options.projects ?? [{ alias: 'alpha', host: 'h1' }, { alias: 'beta', host: 'h2' }], hosts: options.hosts ?? [], connections: rows, session });
+      return Response.json({ projects: options.projects ?? [{ alias: 'alpha', host: 'h1', label: 'alpha' }, { alias: 'beta', host: 'h2', label: 'beta' }], hosts: options.hosts ?? [], connections: rows, session });
     }
     assert.match(path, /^api\/webhooks\/(connect|replace|test|disconnect)$/);
     assert.equal(init.method, 'POST');
@@ -244,6 +244,13 @@ async function webhookPage(options: {
 }
 
 describe('dashboard webhook connections: running browser handlers', () => {
+  test('connection cards render the gateway display name without resolving project names', async () => {
+    const page = await webhookPage({ connections: [{ ...webhookRow(), displayName: 'Gateway supplied name' }] });
+    const card = page.root.elements('article')[0]!;
+    assert.equal(card.elements('h3')[0]!.textContent, 'Gateway supplied name');
+    assert.equal(card.getAttribute('aria-label'), 'Connection for Gateway supplied name on h1');
+  });
+
   test('overview entry and setup use two accessible paste fields, configured projects and a safe private-panel prompt', async () => {
     const page = await webhookPage();
     assert.equal(page.root.elements('input').filter((node) => ['webhook-url', 'webhook-auth'].includes(node.getAttribute('id') ?? '')).length, 2, 'two receiver fields');
@@ -475,15 +482,15 @@ test('job PR badges show number and state without adding arbitrary links', async
 });
 
 
-test('webhook picker groups discovered names and IDs by host and explains unavailable hosts without hiding usable choices', async () => {
+test('webhook picker renders gateway labels grouped by host and explains unavailable hosts without hiding usable choices', async () => {
   const key = JSON.stringify(['host-b', 'project-1']);
   const page = await webhookPage({ projects: [
-    { alias: 'local-alias', host: 'host-a' },
-    { alias: key, host: 'host-b', projectId: 'project-1', name: 'Synthetic reader' },
+    { alias: 'local-alias', host: 'host-a', label: 'Server alias label' },
+    { alias: key, host: 'host-b', projectId: 'project-1', name: 'Synthetic reader', label: 'Server project label' },
   ], hosts: [{ host: 'host-c', status: 'unavailable' }] });
   const picker = page.field('webhook-project');
   assert.deepEqual(picker.elements('optgroup').map((g) => g.getAttribute('label')), ['host-a', 'host-b']);
-  assert.deepEqual(picker.elements('option').map((o) => o.textContent), ['local-alias', 'Synthetic reader (project-1)']);
+  assert.deepEqual(picker.elements('option').map((o) => o.textContent), ['Server alias label', 'Server project label']);
   assert.match(page.root.textContent, /host-c: unavailable/);
   assert.ok(picker.elements('option').some((o) => o.getAttribute('value') === key));
 });

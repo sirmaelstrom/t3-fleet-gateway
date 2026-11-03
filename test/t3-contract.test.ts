@@ -127,7 +127,7 @@ describe('T3 advertised input checks', () => {
     await client.connect(new StreamableHTTPClientTransport(new URL('/mcp', fake.url), { authProvider: { token: async () => token } }));
     const tools = (await client.listTools()).tools;
     const checks = checkInputs(tools);
-    assert.equal(checks.length, pendingRequestTools === 'legacy' ? 12 : 10);
+    assert.equal(checks.length, pendingRequestTools === 'legacy' ? 13 : 11);
     assert.ok(checks.every((check) => check.status === 'pass'), JSON.stringify(checks));
     assert.deepEqual(fake.calls, [], 'discovery and schema validation must not call mutation or read tools');
   });
@@ -267,4 +267,19 @@ describe('T3 advertised input checks', () => {
     assert.equal(checks[0]!.status, 'pass');
     assert.equal(checks[1]!.status, 'fail');
   });
+});
+
+
+test('compatibility probe validates exact settlement inputs against a strict organize schema without requiring it on older hosts', () => {
+  const tools = permissiveTools();
+  assert.ok(checkInputs(tools).every((check) => check.status === 'pass'));
+  const organize: AdvertisedTool = { name: 't3_thread_organize', inputSchema: {
+    type: 'object', additionalProperties: false, required: ['action'],
+    properties: { threadId: { type: 'string' }, action: { enum: ['pin', 'settle', 'archive'] } },
+  } };
+  tools.push(organize);
+  assert.equal(checkInputs(tools).find((check) => check.tool === organize.name)?.status, 'pass');
+  assert.ok(snapshotContract(tools)[organize.name]);
+  organize.inputSchema.required = ['action', 'newRequiredField'];
+  assert.equal(checkInputs(tools).find((check) => check.tool === organize.name)?.status, 'fail');
 });

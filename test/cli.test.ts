@@ -246,6 +246,37 @@ describe('cli', () => {
     assert.match((await run(env, ['clients', 'list'])).out, new RegExp(`${clientId}\\s+Expired bearer\\s+-\\s+revoked\\s`));
   });
 
+  test('clients list reports all bearer tokens revoked without revoking their client', async (t) => {
+    const env = await environment(t);
+    const minted = await run(env, ['clients', 'token', '--name', 'Revocation bot']);
+    const clientId = /^Created client (\S+)/.exec(minted.out)![1]!;
+    const inventory = JSON.parse((await run(env, ['clients', 'tokens', clientId])).out);
+    const rotated = await run(env, ['clients', 'rotate', clientId, '--token-id', inventory[0].id, '--overlap', '1d']);
+    assert.equal(rotated.code, 0, rotated.err);
+    const tokens = JSON.parse((await run(env, ['clients', 'tokens', clientId])).out);
+    assert.equal(tokens.length, 2);
+    for (const token of tokens) {
+      assert.equal((await run(env, ['clients', 'revoke-token', clientId, '--token-id', token.id])).code, 0);
+    }
+    assert.match((await run(env, ['clients', 'list'])).out, /Revocation bot\s+read \(all hosts\)\s+tokens revoked|Revocation bot\s+operate \(all hosts\)\s+tokens revoked/);
+    assert.match((await run(env, ['clients', 'list'])).out, /bearer token, none unrevoked/);
+  });
+
+  test('clients projects inspects, replaces and removes a policy without changing bearer secrets', async (t) => {
+    const env = await environment(t, undefined, { projects: [{ alias: 'pilot', host: 'main', t3ProjectId: 'project-1' }] });
+    const minted = await run(env, ['clients', 'token', '--name', 'Project bot']);
+    const clientId = /^Created client (\S+)/.exec(minted.out)![1]!;
+    assert.deepEqual(JSON.parse((await run(env, ['clients', 'projects', clientId])).out), { projects: null });
+    const selected = await run(env, ['clients', 'projects', clientId, '--project', 'pilot', '--project', '@main/project-2']);
+    assert.equal(selected.code, 0, selected.err);
+    assert.deepEqual(JSON.parse(selected.out).projects, [{ host: 'main', alias: 'pilot', projectId: 'project-1' }, { host: 'main', projectId: 'project-2' }]);
+    assert.equal((await run(env, ['clients', 'projects', clientId, '--project', 'unknown'])).code, 1);
+    assert.equal((await run(env, ['clients', 'projects', clientId, '--project', 'pilot', '--all-projects'])).code, 2);
+    assert.deepEqual(JSON.parse((await run(env, ['clients', 'projects', clientId, '--no-projects'])).out), { projects: [] });
+    assert.deepEqual(JSON.parse((await run(env, ['clients', 'projects', clientId, '--all-projects'])).out), { projects: null });
+    assert.equal(JSON.parse((await run(env, ['clients', 'tokens', clientId])).out).length, 1, 'same token remains');
+  });
+
   test('clients token mints a bearer token that works at /mcp until it is revoked', async (t) => {
     const env = await environment(t);
     for (const [args, message] of [
@@ -295,6 +326,17 @@ describe('cli', () => {
       await until(/"event":"gateway.started"/);
       const agent = await agentWithToken(t, env.door.url, clientId, token);
       assert.deepEqual(await agent.call('work_list', {}), { jobs: [] });
+      const usage = JSON.parse((await run(env, ['clients', 'tokens', clientId])).out);
+      assert.equal(usage[0].callsThisHour, 1);
+      assert.ok(usage[0].lastUsedAt);
+      const rotated = await run(env, ['clients', 'rotate', clientId, '--token-id', usage[0].id, '--overlap', '7d']);
+      assert.equal(rotated.code, 0, rotated.err);
+      const replacement = rotated.out.split('\n')[1]!;
+      assert.equal((await initialize(token)).status, 200);
+      assert.equal((await initialize(replacement)).status, 200);
+      assert.equal((await run(env, ['clients', 'revoke-token', clientId, '--token-id', usage[0].id])).code, 0);
+      assert.equal((await initialize(token)).status, 401);
+      assert.equal((await initialize(replacement)).status, 200);
       const readOnly = await agentWithToken(t, env.door.url, '', readToken);
       assert.equal((await readOnly.callError('work_start', { project: 'x', task: 'x', requestId: 'r1' })).code, 'insufficient_scope');
       assert.equal((await run(env, ['clients', 'revoke', clientId])).code, 0);

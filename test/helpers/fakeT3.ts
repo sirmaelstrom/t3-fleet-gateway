@@ -129,6 +129,8 @@ export interface FakeThread {
   /** Current T3 lists both shelves when settled is omitted. */
   settled: boolean;
   archived?: boolean;
+  sideChat?: boolean;
+  relationshipToParent?: 'fork' | null;
   createdAt: string;
   updatedAt: string;
   launch: Record<string, unknown>;
@@ -242,7 +244,7 @@ export class FakeT3 {
   readonly toolsListPages = new Map<string, Record<string, unknown>>();
   tokenLifetimeSeconds: number;
   /** `workspaceRoot` is the folder T3 reports for the project; the workspace probe reads it (src/jobs/workspace.ts). */
-  readonly projects: { id: string; title: string; deletedAt: string | null; defaultModelSelection: Record<string, unknown> | null; workspaceRoot?: string }[];
+  readonly projects: { id: string; title: string; deletedAt: string | null; defaultModelSelection: Record<string, unknown> | null; workspaceRoot?: string; pinnedAt?: string | null; archivedAt?: string | null }[];
   /** The providers, models and options this host advertises in orchestrator_capabilities; tests change it between calls. */
   providers: FakeProvider[] = syntheticProviders();
   /** When set, t3_project_list answers every page with this same nextCursor (a catalog that never converges). */
@@ -826,7 +828,7 @@ export class FakeT3 {
       const matching = [...this.threads.values()]
         .filter(
           (thread) =>
-            thread.projectId === projectId && !thread.archived &&
+            thread.projectId === projectId && !thread.archived && !thread.sideChat &&
             (input.includeSubagents !== false || !this.#delegations.has(thread.threadId)) &&
             (input.settled == null || thread.settled === input.settled) &&
             (!input.titleContains || thread.title.includes(input.titleContains)),
@@ -1105,7 +1107,7 @@ export class FakeT3 {
       snoozed: false,
       snoozedUntil: null,
       parentThreadId: this.#delegations.get(thread.threadId)?.parentThreadId ?? null,
-      relationshipToParent: this.#delegations.has(thread.threadId) ? 'subagent' : null,
+      relationshipToParent: this.#delegations.has(thread.threadId) ? 'subagent' : thread.relationshipToParent ?? null,
       itemCount: thread.items.length,
       createdAt: thread.createdAt,
       updatedAt: thread.updatedAt,

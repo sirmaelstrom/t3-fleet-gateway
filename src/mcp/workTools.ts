@@ -402,7 +402,7 @@ export function workTools(jobs: JobService): GatewayTool[] {
     }),
     outputSchema: z.object({ jobs: z.array(jobSchema) }),
     async run(input, context) {
-      const found = jobs.list({ project: input.project, target: input.target, states: input.states, mine: input.mine, limit: input.limit ?? 20 }, context);
+      const found = await jobs.list({ project: input.project, target: input.target, states: input.states, mine: input.mine, limit: input.limit ?? 20 }, context);
       const views = found.map((job) => jobView(job, context));
       const summary = views.length === 0 ? 'No matching jobs.' : found.map((job, i) => describeJob(job, views[i]!)).join('\n');
       return { structured: { jobs: views }, summary };

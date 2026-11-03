@@ -27,6 +27,7 @@ export function threadTools(deps: GatewayServices) {
       if (!caller.scopes.includes(THREAD_READ_SCOPE)) throw new GatewayError('insufficient_scope', 'fleet_threads requires threads:read. Ask the operator to use clients grant.');
       const host = deps.config.hosts.find((candidate) => candidate.id === input.host);
       if (!host || !permits(caller.scopes, 'read', host.id)) throw new GatewayError('not_found', 'No host with that id. Use fleet_status.');
+      await deps.jobs.authorizeProject(caller, host.id, input.projectId);
       if (!host.discovery.enabled) throw new GatewayError('discovery_disabled', 'Thread discovery needs discovery.enabled on this host.');
       if (input.cursor && input.refresh) throw new GatewayError('invalid_argument', 'Pass refresh or cursor, not both.');
       let snapshot: Snapshot<CatalogThread[]>;
@@ -49,7 +50,7 @@ export function threadTools(deps: GatewayServices) {
       }
       const threads = snapshot.value.slice(offset, offset + (input.limit ?? 50)).map((thread) => {
         // Ownership is current ledger state, never part of the cached T3 snapshot.
-        const job = deps.jobs.store.jobForThread(host.id, thread.threadId);
+        const job = deps.jobs.store.jobForThread(host.id, thread.threadId, { projects: deps.jobs.projectAccess(caller) });
         return { ...thread, gatewayOwned: job?.origin === 'gateway', jobId: job?.id ?? null, origin: job?.origin ?? null };
       });
       const end = offset + threads.length;

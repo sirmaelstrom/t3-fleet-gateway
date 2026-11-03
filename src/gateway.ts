@@ -75,7 +75,7 @@ export function openServices(options: ServiceOptions): GatewayServices {
   const { config, logger } = options;
   const clock = options.clock ?? systemClock;
   const { db, key } = openStorage(options.dataDir);
-  const webhooks = new WebhookStore(db, clock);
+  const webhooks = new WebhookStore(db, clock, config.projects);
   const alerts = new CredentialAlerts(db, clock, config, webhooks);
   const registry = new HostRegistry({
     hosts: config.hosts,
@@ -101,7 +101,7 @@ export function openServices(options: ServiceOptions): GatewayServices {
     catalog,
     threads: new ThreadCatalog(registry, clock, logger),
     webhooks,
-    jobs: new JobService({ config, store: new JobStore(db, clock, logger), registry, catalog, clock, logger }),
+    jobs: new JobService({ config, store: new JobStore(db, clock, logger, webhooks), registry, catalog, clock, logger }),
     async close() {
       await registry.close();
       db.close();

@@ -14,6 +14,8 @@ export const projectSchema = z.looseObject({
   id: z.string(),
   title: z.string(),
   deletedAt: z.string().nullable().optional(),
+  pinnedAt: z.string().nullish(),
+  archivedAt: z.string().nullish(),
   /** The folder the project points at on its host. Only the workspace probe uses it; never shown to agents or logged. */
   workspaceRoot: z.string().nullish(),
   /** The model T3 uses for a launch that passes no `modelSelection`; without one, such a launch is refused. */

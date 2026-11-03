@@ -1,4 +1,5 @@
-import { configuredModel, runtimeModeAllowed, type GatewayConfig, type HostConfig, type ProjectConfig, type RuntimeMode } from '../config.ts';
+import { allowsProject, expandProjectAccess } from '../oauth/projectAccess.ts';
+import { configuredModel, RUNTIME_MODES, runtimeModeAllowed, type GatewayConfig, type HostConfig, type ProjectConfig, type RuntimeMode } from '../config.ts';
 import { describeError, GatewayError } from '../errors.ts';
 import type { CatalogService } from '../hosts/catalog.ts';
 import type { HostRegistry } from '../hosts/registry.ts';
@@ -71,6 +72,16 @@ function foundThread(thread: { threadId: string; title: string; latestRunId: str
 
 function isHostFailure(error: unknown): error is GatewayError {
   return error instanceof GatewayError && !(error instanceof T3ToolError) && HOST_FAILURES.has(error.code);
+}
+
+/**
+ * Whether the runtime mode a queued job will launch with is still allowed: within the host's access ceiling and no broader
+ * than the runtime mode the job's project policy (its alias, or the host's discovery policy) has now. A job accepted under a
+ * broader policy is never launched with it, and never silently given another mode.
+ */
+function runtimeModeFits(mode: string, host: HostConfig, policy: RuntimeMode): boolean {
+  const known = RUNTIME_MODES.find((candidate) => candidate === mode);
+  return known !== undefined && runtimeModeAllowed(known, host.access) && RUNTIME_MODES.indexOf(known) <= RUNTIME_MODES.indexOf(policy);
 }
 
 /** Appended to every task so the worker (and anyone reading the thread) knows where it came from. */
@@ -322,8 +333,13 @@ export class JobEngine {
       for (const job of queued) {
         if (launched >= free || budget.probes <= 0 || this.#shutdown.signal.aborted) return;
         tried.add(job.id);
-        const plan = job.launchSpec ? await this.#planFromSpec(host, job, job.launchSpec, budget) : await this.#planFromConfig(job);
+        const plan = job.launchSpec ? await this.#planFromSpec(host, job, job.launchSpec, budget) : await this.#planFromConfig(host, job);
         if (!plan) continue;
+        const access = expandProjectAccess(store.projectAccess(job.clientId), this.#options.config);
+        if (!allowsProject(access, job.hostId, job.projectAlias, plan.projectId)) {
+          this.#failQueued(job, 'insufficient_scope', 'The client is no longer approved for this project.');
+          continue;
+        }
         const changes = { t3ProjectId: plan.projectId, dispatchStartedAt: clock() };
         // A resolved workspace is claimed with the ledger (which also takes a root job's folder, or refuses it); the rest transition as before.
         const claim = plan.resolved
@@ -358,7 +374,7 @@ export class JobEngine {
   }
 
   /** The launch of an alias-only job: its project resolved on the host now. Undefined when the job failed instead. */
-  async #planFromConfig(job: Job): Promise<LaunchPlan | undefined> {
+  async #planFromConfig(host: HostConfig, job: Job): Promise<LaunchPlan | undefined> {
     const { config } = this.#options;
     const project = config.projects.find((candidate) => candidate.alias === job.projectAlias);
     if (!project) {
@@ -367,6 +383,10 @@ export class JobEngine {
     }
     if (project.host !== job.hostId || project.workspaceMode !== 'worktree') {
       this.#failQueued(job, 'launch_policy_changed', 'The configured project host or workspace mode changed. Start the work again under the current policy.');
+      return undefined;
+    }
+    if (!runtimeModeFits(job.runtimeMode, host, project.runtimeMode)) {
+      this.#failQueued(job, 'launch_policy_changed', `Not launched: the job's runtime mode exceeds the current policy of project "${project.alias}" or host ${host.id}. Start the work again under the current policy.`);
       return undefined;
     }
     try {
@@ -419,6 +439,7 @@ export class JobEngine {
         if (!mapping.aliases.includes(alias)) changed = `project "${alias.alias}" no longer resolves to T3 project ${projectId} on host ${job.hostId}`;
         else if (alias.workspaceMode !== (spec.v === 2 ? 'scratch' : 'worktree')) changed = `project "${alias.alias}" changed workspace mode`;
         else if (spec.v !== 1 && alias.runtimeMode !== spec.runtimeMode) changed = `project "${alias.alias}" changed runtime mode`;
+        else if (!runtimeModeFits(job.runtimeMode, host, alias.runtimeMode)) changed = `the job's runtime mode exceeds the current policy of project "${alias.alias}"`;
         else if (!alias.allowWorkStart) changed = `project "${alias.alias}" no longer accepts work_start`;
       } else {
         const policy = launchPolicy(host, mapping);
@@ -427,6 +448,8 @@ export class JobEngine {
           changed = `T3 project ${projectId} on host ${job.hostId} is now configured under ${aliases.length === 1 ? 'alias' : 'aliases'} ${aliases.join(', ')}`;
         } else if (!host.discovery.enabled || !host.discovery.allowWorkStart) {
           changed = `host ${job.hostId} no longer accepts work_start into T3 projects without a configured alias`;
+        } else if (!runtimeModeFits(job.runtimeMode, host, host.discovery.runtimeMode)) {
+          changed = `the job's runtime mode exceeds the current discovery policy of host ${job.hostId}`;
         }
       }
       if (changed) {

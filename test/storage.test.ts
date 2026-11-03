@@ -65,6 +65,7 @@ describe('database', () => {
       'approval_codes',
       'approval_failures',
       'authorization_codes',
+      'client_project_access',
       'client_thread_scopes',
       'credential_alerts',
       'credential_deliveries',
@@ -77,6 +78,8 @@ describe('database', () => {
       'jobs',
       'oauth_clients',
       'operator_scope_events',
+      'operator_token_calls',
+      'operator_tokens',
       'refresh_tokens',
       'thread_action_events',
       'token_families',
@@ -128,7 +131,7 @@ describe('database', () => {
     const db = openDatabase(path);
     t.after(() => db.close());
     assert.equal(schemaVersion(db), SCHEMA_VERSION);
-    assert.equal(SCHEMA_VERSION, 19);
+    assert.equal(SCHEMA_VERSION, 21);
     const after = db.prepare('SELECT * FROM jobs ORDER BY rowid').all() as Record<string, unknown>[];
     assert.deepEqual(
       after.map(
@@ -557,7 +560,7 @@ CREATE TABLE jobs (
     const db = openDatabase(path);
     t.after(() => db.close());
     assert.equal(schemaVersion(db), SCHEMA_VERSION);
-    assert.equal(SCHEMA_VERSION, 19);
+    assert.equal(SCHEMA_VERSION, 21);
     assert.deepEqual(['jobs', 'job_events', 'idempotency_keys'].map((table) => rowsWithoutV12(db, table)), before, 'no existing column changes');
     const added = db.prepare('SELECT workspace_kind, workspace_root_key, workspace_root_held_at, workspace_resume_tokens, probe_attempts, probe_retry_at FROM jobs ORDER BY rowid').all().map((row) => ({ ...row }));
     assert.deepEqual(added, Array(2).fill({ workspace_kind: null, workspace_root_key: null, workspace_root_held_at: null, workspace_resume_tokens: '[]', probe_attempts: 0, probe_retry_at: null }));
@@ -572,7 +575,7 @@ CREATE TABLE jobs (
     db.prepare("UPDATE jobs SET host_id = 'other' WHERE id = 'legacy0002'").run();
     hold('legacy0002', 'folder-a');
     assert.throws(() => db.prepare("UPDATE jobs SET workspace_kind = 'checkout' WHERE id = 'legacy0001'").run(), /CHECK/);
-    assert.throws(() => migrate(db, MIGRATIONS.slice(0, 11)), /schema version 19 is newer than this build supports \(11\)/);
+    assert.throws(() => migrate(db, MIGRATIONS.slice(0, 11)), /schema version 21 is newer than this build supports \(11\)/);
     assert.equal(db.prepare('PRAGMA integrity_check').get()!.integrity_check, 'ok');
     const fresh = openDatabase(join(tempDir(t), 'fresh.db'));
     t.after(() => fresh.close());
@@ -816,4 +819,24 @@ test('migration 17 preserves populated version 16 jobs and adds private queued a
   assert.equal(db.prepare('SELECT COUNT(*) AS n FROM job_launch_attachments').get()!.n, 0);
   assert.equal(db.prepare('PRAGMA integrity_check').get()!.integrity_check, 'ok');
   assert.throws(() => migrate(db, MIGRATIONS.slice(0, 16)), /newer than this build supports/);
+});
+
+
+test('migration 20 gives existing bearer tokens safe IDs without changing their grants or values', (t) => {
+  const db = new DatabaseSync(join(tempDir(t), 'rotation.db'));
+  t.after(() => db.close());
+  db.exec('PRAGMA foreign_keys = ON');
+  migrate(db, MIGRATIONS.slice(0, 19));
+  db.exec(`INSERT INTO oauth_clients (id, name, redirect_uris, created_at) VALUES ('bot', 'Bot', '[]', 1);
+    INSERT INTO token_families (id, client_id, scope, resource, created_at) VALUES ('grant', 'bot', 'fleet:read', 'https://gateway.example.com/mcp', 1);
+    INSERT INTO access_tokens (token_hash, family_id, refresh_token_hash, scope, created_at, expires_at)
+      VALUES ('synthetic-hash', 'grant', '', 'fleet:read', 1, 9999);`);
+  const before = db.prepare('SELECT * FROM access_tokens').all();
+  migrate(db);
+  assert.deepEqual(db.prepare('SELECT * FROM access_tokens').all(), before);
+  const metadata = db.prepare('SELECT * FROM operator_tokens').get()!;
+  assert.match(metadata.id as string, /^[a-f0-9]{24}$/);
+  assert.equal(metadata.last_used_at, null);
+  assert.deepEqual(db.prepare('SELECT * FROM operator_token_calls').all(), []);
+  assert.deepEqual(db.prepare('PRAGMA foreign_key_check').all(), []);
 });

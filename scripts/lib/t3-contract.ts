@@ -14,10 +14,15 @@ export const REQUIRED_TOOLS = [
   't3_pending_request_read', 't3_pending_request_respond', 't3_pending_request',
 ] as const;
 
-/** Prefer the combined tool, otherwise require every legacy action. */
+const OPTIONAL_TOOLS = ['t3_thread_organize'] as const;
+
+/** Prefer the combined tool, otherwise require every legacy action. Check optional mutations when advertised. */
 function requiredTools(indexed: ReadonlyMap<string, AdvertisedTool>) {
-  return REQUIRED_TOOLS.filter((name) => indexed.has('t3_pending_request')
-    ? !name.startsWith('t3_pending_request_') : name !== 't3_pending_request');
+  return [
+    ...REQUIRED_TOOLS.filter((name) => indexed.has('t3_pending_request')
+      ? !name.startsWith('t3_pending_request_') : name !== 't3_pending_request'),
+    ...OPTIONAL_TOOLS.filter((name) => indexed.has(name)),
+  ];
 }
 
 export type Contract = Record<string, { inputSchema: Record<string, unknown>; outputSchema?: Record<string, unknown> }>;
@@ -206,7 +211,7 @@ const LAUNCH = {
 };
 
 /** Sample requests, not exhaustive schema compatibility proof. None of these are sent to a host. */
-const INPUT_SAMPLES: Record<(typeof REQUIRED_TOOLS)[number], Record<string, unknown>[]> = {
+const INPUT_SAMPLES: Record<(typeof REQUIRED_TOOLS)[number] | (typeof OPTIONAL_TOOLS)[number], Record<string, unknown>[]> = {
   t3_environment_read: [{}],
   t3_project_list: [{ limit: 100 }, { limit: 100, cursor: 100 }],
   orchestrator_capabilities: [{}],
@@ -230,6 +235,7 @@ const INPUT_SAMPLES: Record<(typeof REQUIRED_TOOLS)[number], Record<string, unkn
     { projectId: PROJECT_ID, settled: true, limit: 100 },
   ],
   t3_thread_search: [{ projectId: PROJECT_ID, query: 'synthetic', limit: 20 }],
+  t3_thread_organize: [{ threadId: THREAD_ID, action: 'settle' }],
   t3_thread_send: [{ threadId: THREAD_ID, message: 'Synthetic sample; never sent.', mode: 'auto', clientRequestId: CLIENT_REQUEST_ID }],
   t3_thread_interrupt: [
     { threadId: THREAD_ID, clientRequestId: CLIENT_REQUEST_ID },

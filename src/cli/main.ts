@@ -1,3 +1,4 @@
+import { projectAccess, projectGrant, setProjectAccess } from '../oauth/projectAccess.ts';
 import { parseArgs } from 'node:util';
 import { loadConfig, mcpResource, resolvePaths, type GatewayConfig, type Paths } from '../config.ts';
 import { describeError, GatewayError, isGatewayError } from '../errors.ts';
@@ -18,7 +19,7 @@ import { GATEWAY_NAME, GATEWAY_VERSION } from '../version.ts';
 import { pingStoredWebhook, pingWebhook } from '../webhooks/sender.ts';
 import { WebhookStore } from '../webhooks/store.ts';
 import { runDoctor } from './doctor.ts';
-import { relative, shortTime, table } from './format.ts';
+import { escapeControls, relative, shortTime, table } from './format.ts';
 
 export interface CliIo {
   env: NodeJS.ProcessEnv;
@@ -41,6 +42,13 @@ Commands:
                             Mint a bearer token for an agent that cannot sign in with OAuth;
                             --hosts limits it to those host ids (default all: every host,
                             including hosts added later)
+  clients projects <id> [--project <alias|@host/projectId> ... | --all-projects | --no-projects]
+                            Show or replace project access (omitted policy: all projects)
+  clients tokens <id>        List bearer token IDs, expiry, last use and recent tool call counts
+  clients rotate <id> --token-id <id> --overlap 7d [--ttl 1y|never]
+                            Print a replacement token once, preserving client and scopes
+  clients revoke-token <id> --token-id <id>
+                            Immediately revoke just that bearer token
   clients diagnose <id>      Diagnose stored grants and authentication recovery (offline)
   clients grant <id> --scope threads:read [--scope threads:control]
                             Add external-thread scopes in place (same token, no restart)
@@ -178,14 +186,62 @@ async function clientToken(paths: Paths, io: CliIo, options: TokenOptions): Prom
       );
     }
     const expiresAt = ttl === null ? NEVER_EXPIRES : clock() + ttl;
-    const { clientId, token } = tokens.issueOperatorToken({ name, scopes: scopesForGrant(access, hosts), expiresAt });
+    const { clientId, token, tokenId } = tokens.issueOperatorToken({ name, scopes: scopesForGrant(access, hosts), expiresAt });
     const expiry = ttl === null ? 'never expires' : `expires ${shortTime(expiresAt)} (${relative(ttl)})`;
     io.out(`Created client ${clientId} ("${name}", ${access} access to ${describeHosts(hosts)}). Its token ${expiry}:`);
     io.out(token);
     io.out("This is the only time the token is shown. Put it in the agent's bearer token setting (Authorization: Bearer <token>).");
+    io.out(`Token ID: ${tokenId}`);
     io.out(`Revoke it with: clients revoke ${clientId}`);
     return 0;
   });
+}
+
+async function manageTokens(paths: Paths, io: CliIo, action: string, clientId: string | undefined,
+  tokenId: string | undefined, overlap: string | undefined, ttlText: string | undefined): Promise<number> {
+  if (!clientId) throw new UsageError(`clients ${action} needs a client id`);
+  if (action !== 'tokens' && !tokenId) throw new UsageError('--token-id is required (see clients tokens <client id>)');
+  const overlapMs = overlap === '0' ? 0 : parseDuration(overlap ?? '');
+  if (action === 'rotate' && (overlapMs === undefined || overlapMs < 0 || overlapMs > 30 * DAY)) {
+    throw new UsageError('--overlap is required: 0 or a duration up to 30d');
+  }
+  const ttl = ttlText === 'never' ? null : ttlText === undefined ? DEFAULT_TOKEN_TTL : parseDuration(ttlText);
+  if (action === 'rotate' && (ttl === undefined || (ttl !== null && (ttl < HOUR || ttl > MAX_TOKEN_TTL)))) {
+    throw new UsageError('--ttl must be a duration from 1h to 100y, or never');
+  }
+  return withServices(paths, silentLogger, io.env, async ({ tokens, clients, clock }) => {
+    if (!clients.get(clientId)) throw new GatewayError('not_found', 'No client with that id.');
+    if (action === 'tokens') io.out(JSON.stringify(tokens.operatorTokens(clientId), null, 2));
+    if (action === 'revoke-token') {
+      tokens.revokeOperatorToken(clientId, tokenId!);
+      io.out('Revoked bearer token. It no longer works.');
+    }
+    if (action === 'rotate') {
+      const result = tokens.rotateOperatorToken(clientId, tokenId!, overlapMs!, ttl === null ? NEVER_EXPIRES : clock() + ttl!);
+      io.out(`Replacement token ID: ${result.tokenId}. This is the only time its secret is shown:`);
+      io.out(result.token);
+    }
+    return 0;
+  });
+}
+
+function clientProjects(paths: Paths, io: CliIo, clientId: string | undefined,
+  refs: string[] | undefined, all: boolean | undefined, none: boolean | undefined): number {
+  if (!clientId) throw new UsageError('clients projects needs a client id');
+  if (Number(refs !== undefined) + Number(all === true) + Number(none === true) > 1) {
+    throw new UsageError('Choose --project, --all-projects or --no-projects.');
+  }
+  if (refs && refs.length > 100) throw new UsageError('At most 100 projects per client.');
+  const storage = openStorage(paths.dataDir);
+  try {
+    if (!new ClientStore(storage.db, systemClock).get(clientId)) throw new GatewayError('not_found', 'No client with that id.');
+    if (refs || all || none) {
+      const config = loadConfig(paths.configPath);
+      setProjectAccess(storage.db, clientId, all ? undefined : refs?.map((ref) => projectGrant(config, ref)) ?? []);
+    }
+    io.out(JSON.stringify({ projects: projectAccess(storage.db, clientId) ?? null }));
+    return 0;
+  } finally { storage.db.close(); }
 }
 
 function clients(paths: Paths, io: CliIo, action: string | undefined, id: string | undefined, scopes: string[] = []): number {
@@ -202,7 +258,7 @@ function clients(paths: Paths, io: CliIo, action: string | undefined, id: string
       if (!id) throw new UsageError('clients scopes needs a client id (see clients list).');
       const client = store.list().find((candidate) => candidate.id === id);
       if (!client) throw new GatewayError('not_found', 'No client with that id.');
-      io.out(`Client: ${client.id}\nName: ${client.name}\nScopes: ${client.scopes.join(' ') || '(none)'}\nThread scopes: ${clientThreadScopes(storage.db, id).join(' ') || '(none)'}`);
+      io.out(`Client: ${client.id}\nName: ${escapeControls(client.name)}\nScopes: ${client.scopes.join(' ') || '(none)'}\nThread scopes: ${clientThreadScopes(storage.db, id).join(' ') || '(none)'}`);
       return 0;
     }
     if (action === 'list') {
@@ -216,9 +272,11 @@ function clients(paths: Paths, io: CliIo, action: string | undefined, id: string
         const access = describeAccess(client.scopes);
         const expired = client.tokenExpiresAt !== null && client.tokenExpiresAt <= now;
         const status = client.revokedAt !== null ? 'revoked' : client.totalFamilies === 0 ? 'pending'
-          : client.activeFamilies === 0 ? 'grants revoked' : expired ? 'expired' : isTokenClient(client) ? 'active' : 'unrevoked';
+          : client.activeFamilies === 0 ? 'grants revoked' : isTokenClient(client) && client.tokenExpiresAt === null ? 'tokens revoked'
+            : expired ? 'expired' : isTokenClient(client) ? 'active' : 'unrevoked';
         const signIn = !isTokenClient(client)
           ? `${[...new Set(client.redirectUris.map((uri) => new URL(uri).origin))].join(' ')} (${client.activeFamilies} unrevoked grants; diagnose for usability)`
+          : client.tokenExpiresAt === null ? 'bearer token, none unrevoked'
           : client.tokenExpiresAt === NEVER_EXPIRES
             ? 'bearer token, never expires'
             : `bearer token, expires ${shortTime(client.tokenExpiresAt)}`;
@@ -340,7 +398,7 @@ async function hosts(paths: Paths, io: CliIo, action: string | undefined, id: st
 }
 
 function describeJobLine(job: Job): string {
-  return `${job.id}  ${job.projectAlias}  ${job.state}${job.standing ? '  standing' : ''}  ${job.title}${job.threadLink ? `  ${job.threadLink}` : ''}`;
+  return `${job.id}  ${job.projectAlias}  ${job.state}${job.standing ? '  standing' : ''}  ${escapeControls(job.title)}${job.threadLink ? `  ${escapeControls(job.threadLink)}` : ''}`;
 }
 
 const MAX_LISTED_JOBS = 1000;
@@ -460,6 +518,11 @@ export async function runCli(argv: readonly string[], io: CliIo): Promise<number
         config: { type: 'string' },
         'data-dir': { type: 'string' },
         ttl: { type: 'string' },
+        project: { type: 'string', multiple: true },
+        'all-projects': { type: 'boolean' },
+        'no-projects': { type: 'boolean' },
+        'token-id': { type: 'string' },
+        overlap: { type: 'string' },
         name: { type: 'string' },
         access: { type: 'string' },
         hosts: { type: 'string' },
@@ -493,7 +556,12 @@ export async function runCli(argv: readonly string[], io: CliIo): Promise<number
     }
     // Each of these options belongs to one command; anywhere else it would be ignored silently.
     const optionCommands = [
-      ['ttl', values.ttl, 'pair and clients token', command === 'pair' || (command === 'clients' && action === 'token')],
+      ['project', values.project, 'clients projects', command === 'clients' && action === 'projects'],
+      ['all-projects', values['all-projects'], 'clients projects', command === 'clients' && action === 'projects'],
+      ['no-projects', values['no-projects'], 'clients projects', command === 'clients' && action === 'projects'],
+      ['token-id', values['token-id'], 'clients rotate/revoke-token', command === 'clients' && (action === 'rotate' || action === 'revoke-token')],
+      ['overlap', values.overlap, 'clients rotate', command === 'clients' && action === 'rotate'],
+      ['ttl', values.ttl, 'pair and clients token/rotate', command === 'pair' || (command === 'clients' && (action === 'token' || action === 'rotate'))],
       ['name', values.name, 'clients token', command === 'clients' && action === 'token'],
       ['access', values.access, 'clients token', command === 'clients' && action === 'token'],
       ['hosts', values.hosts, 'clients token', command === 'clients' && action === 'token'],
@@ -517,6 +585,10 @@ export async function runCli(argv: readonly string[], io: CliIo): Promise<number
       case 'pair':
         return pair(paths, io, values.ttl);
       case 'clients':
+        if (action === 'projects') return clientProjects(paths, io, id, values.project, values['all-projects'], values['no-projects']);
+        if (['tokens', 'rotate', 'revoke-token'].includes(action ?? '')) {
+          return await manageTokens(paths, io, action!, id, values['token-id'], values.overlap, values.ttl);
+        }
         if (action !== 'token') return clients(paths, io, action, id, values.scope);
         if (id !== undefined) throw new UsageError(`Unexpected arguments: ${id}`);
         return await clientToken(paths, io, { name: values.name, access: values.access, hosts: values.hosts, ttl: values.ttl });

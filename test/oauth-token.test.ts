@@ -267,6 +267,7 @@ describe('operator tokens (clients token)', () => {
     const operate = h.tokens.issueOperatorToken({ name: 'Synthetic agent', scopes: ['fleet:read', 'fleet:operate'], expiresAt: now + HOUR });
     const read = h.tokens.issueOperatorToken({ name: 'Synthetic reader', scopes: ['fleet:read'], expiresAt: NEVER_EXPIRES });
     assert.deepEqual(h.tokens.verifyAccessToken(operate.token), {
+      operatorTokenId: operate.tokenId,
       clientId: operate.clientId,
       familyId: h.tokens.verifyAccessToken(operate.token)?.familyId,
       scopes: ['fleet:read', 'fleet:operate'],
@@ -300,4 +301,50 @@ describe('operator tokens (clients token)', () => {
     assert.deepEqual(h.clients.revoke(clientId), { families: 1 });
     assert.equal(h.tokens.verifyAccessToken(token), undefined);
   });
+});
+
+
+test('operator rotation keeps identity, bounds overlaps, records independent usage and revokes immediately', async (t) => {
+  const h = await startOAuthHarness(t);
+  const first = h.tokens.issueOperatorToken({ name: 'Rotation bot', scopes: ['host:main:read'], expiresAt: h.clock() + 2 * DAY });
+  const second = h.tokens.rotateOperatorToken(first.clientId, first.tokenId, HOUR, NEVER_EXPIRES);
+  assert.equal(h.tokens.verifyAccessToken(second.token)?.clientId, first.clientId);
+  assert.deepEqual(h.tokens.verifyAccessToken(second.token)?.scopes, ['host:main:read']);
+  assert.ok(h.tokens.verifyAccessToken(first.token));
+  h.tokens.recordOperatorCall(first.tokenId);
+  h.tokens.recordOperatorCall(second.tokenId);
+  h.tokens.recordOperatorCall(second.tokenId);
+  let inventory = h.tokens.operatorTokens(first.clientId);
+  assert.equal(inventory.find((v) => v.id === second.tokenId)?.calls24Hours, 2);
+  assert.equal(inventory.find((v) => v.id === first.tokenId)?.calls24Hours, 1);
+  assert.equal(inventory.find((v) => v.id === first.tokenId)?.lastUsedAt, h.clock());
+  assert.ok(!JSON.stringify(inventory).includes(first.token));
+  assert.ok(!JSON.stringify(inventory).includes('token_hash'));
+  const third = h.tokens.rotateOperatorToken(first.clientId, second.tokenId, 0, NEVER_EXPIRES);
+  assert.equal(h.tokens.verifyAccessToken(second.token), undefined, 'zero overlap');
+  assert.ok(h.tokens.verifyAccessToken(first.token), 'rotating another token does not revoke a previous overlap');
+  h.clock.advance(HOUR);
+  assert.equal(h.tokens.verifyAccessToken(first.token), undefined, 'exact overlap boundary');
+  assert.ok(h.tokens.verifyAccessToken(third.token));
+  h.tokens.revokeOperatorToken(first.clientId, third.tokenId);
+  assert.equal(h.tokens.verifyAccessToken(third.token), undefined);
+  assert.throws(() => h.tokens.rotateOperatorToken(first.clientId, third.tokenId, HOUR, NEVER_EXPIRES), { code: 'not_found' });
+  h.clock.advance(DAY);
+  inventory = h.tokens.operatorTokens(first.clientId);
+  assert.ok(inventory.every((v) => v.calls24Hours === 0));
+  assert.equal(inventory.find((v) => v.id === second.tokenId)?.lastUsedAt, h.clock() - DAY - HOUR);
+});
+
+test('rotation never extends old expiry, cannot cross clients, and client revocation revokes both tokens', async (t) => {
+  const h = await startOAuthHarness(t);
+  const a = h.tokens.issueOperatorToken({ name: 'A', scopes: ['fleet:read'], expiresAt: h.clock() + HOUR });
+  const b = h.tokens.issueOperatorToken({ name: 'B', scopes: ['fleet:read'], expiresAt: NEVER_EXPIRES });
+  assert.throws(() => h.tokens.rotateOperatorToken(b.clientId, a.tokenId, DAY, NEVER_EXPIRES), { code: 'not_found' });
+  assert.throws(() => h.tokens.revokeOperatorToken(b.clientId, a.tokenId), { code: 'not_found' });
+  const next = h.tokens.rotateOperatorToken(a.clientId, a.tokenId, DAY, NEVER_EXPIRES);
+  assert.equal(h.tokens.operatorTokens(a.clientId).find((v) => v.id === a.tokenId)?.expiresAt, h.clock() + HOUR);
+  h.clients.revoke(a.clientId);
+  assert.equal(h.tokens.verifyAccessToken(a.token), undefined);
+  assert.equal(h.tokens.verifyAccessToken(next.token), undefined);
+  assert.ok(h.tokens.verifyAccessToken(b.token));
 });

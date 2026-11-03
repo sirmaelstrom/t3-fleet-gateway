@@ -2,13 +2,25 @@
 
 ## Unreleased
 
+## 0.3.0 (2026-10-31)
+
 ### Upgrading
+
+- **Migration 21, additive.** Adds optional client project policies; every existing client remains unrestricted. Existing grants, tokens, jobs and notification queues are unchanged. Back up with ledger users stopped. Older builds refuse schema 21; rollback restores the pre-upgrade backup and loses subsequent writes.
+
+- **Migration 20, additive.** Adds safe bearer-token IDs and usage buckets, backfilling existing tokens without changing their values or grants. Stop all ledger users and back up before upgrading. Older builds refuse schema 20; rollback restores the pre-upgrade backup and loses later writes.
 
 - **Migration 19, additive.** Adds persistent credential alerts and a separate outbox sharing webhook delivery health and retries; existing rows remain unchanged. Back up with all ledger users stopped. Older builds refuse schema 19; safe rollback restores the pre-upgrade backup and configuration, losing later writes. Existing connections keep their event selections; explicitly enable `credential_alert` and `credential_resolved` to receive them.
 
 - **Migration 18, forward only.** Adds notification archive, job bindings and persistent delivery health without rewriting existing connection routes, revisions, queues or attempts. Archive/health begin at upgrade; no historical snapshots are invented. Stop all ledger users and back up before opening the new build. Older builds refuse the new schema; rollback requires restoring the pre-upgrade backup and loses subsequent writes. No key rotation or receiver re-registration is needed.
 
 ### Added
+
+- Optional per-client project allowlists via `clients projects`: configured aliases or host/project IDs, intersected with machine access for discovery, jobs, feeds, attention, external threads and bot notifications. Lists apply across OAuth and bearer tokens, including rotation, without a restart. Notification capture, archive replay and pending delivery recheck policy; restricted clients do not receive aggregate cross-project connection history. Omitted policies keep existing behavior; an explicit empty list denies every project.
+
+- Bearer tokens can rotate in place with an explicit overlap window (0 to 30 days), preserving bot identity and access. `clients tokens`, `clients rotate` and `clients revoke-token` expose safe token IDs, creation/expiry, last tool use and recent call counts, with immediate per-token or whole-client revocation. Migration 20 adds hash-linked token metadata and bounded hourly usage buckets, backfilling existing bearer tokens without changing their values or grants.
+
+- T3 v0.1.6 project organization in `fleet_projects`: pinned and archived flags (null on older hosts), with archived-project guidance. Fork adoption/resume now requires a fresh listed conversation, excluding hidden side chats even when their ids are supplied directly. Existing jobs remain watched by their recorded thread id. See the [source compatibility review](docs/evidence/t3-v0.1.6.md); no live v0.1.6 qualification is claimed.
 
 - Deduped downstream credential renewal-failure and configurable expiry alerts (default seven and two days), evaluated only after renewal fails so healthy cycles stay silent, with resolution after verified renewal, intersecting webhook/bot filters and shared delivery health. Current state is shown in the private dashboard and doctor.
 - Confirmed private-dashboard re-pair through the existing configured pairing flow, verifying before atomically installing the replacement and resolving alerts. Failure keeps the old credential; confirmation retries reuse the result. Local enrollment/preflight diagnostics retain bounded stage, HTTP status, recognized error/denial code and command failure reason; raw upstream text, unknown codes and pairing material remain excluded, and notifications contain no diagnostic text.
@@ -22,6 +34,9 @@
 
 ### Fixed
 
+- A queued job is no longer launched with a runtime mode broader than its project's current policy. Before every launch, alias jobs with or without a launch spec and discovered jobs now check the recorded runtime mode against the host access ceiling and the alias's or host's discovery `runtimeMode` as configured at dispatch; a job that exceeds either fails with `launch_policy_changed` and nothing is launched.
+- CLI output escapes terminal control characters in stored values. `jobs list`, `clients list` tables, the job line `jobs adopt` prints and `clients scopes` show C0/C1 controls, DEL, Unicode line separators and bidirectional overrides as visible escapes (`\x1b`, `\u202e`), measured before columns are aligned, so a job title or client name can no longer clear or rewrite the operator's terminal. A literal backslash is shown doubled, so an escape in the output cannot be confused with text that merely looks like one. Stored values are unchanged.
+- A client that disconnects from a 2026-era `subscriptions/listen` stream now releases its subscription. Each MCP exchange carries an abort signal tied to the client going away, and the response body is cancelled when the connection closes, so the SDK's listener, keep-alive and pending handler end with the client. Previously they stayed until the endpoint shut down. Ordinary requests and completed responses are unaffected.
 - Preserve environment-scoped T3 v2 thread links from autolink and bare responses through launch, reconciliation, adoption, job views, webhooks and the dashboard. Legacy v1 links still work; unusable supplied links now fall back to a canonical v1 link instead of losing the Open link. Both v2 segments are bounded and validated before use.
 - Malformed HTTP request targets now return `400` with `invalid_request` instead of causing an uncaught URL parsing error and an unauthenticated restart loop. The request log records only `(invalid)` and status 400, without the raw target. Valid request routing is unchanged.
 

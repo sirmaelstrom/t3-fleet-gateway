@@ -24,6 +24,8 @@ export interface CatalogProject {
   name: string;
   /** Whether T3 launches in this project with a model of the project's own when none is passed. */
   hasDefaultModel: boolean;
+  pinned?: boolean | null;
+  archived?: boolean | null;
 }
 
 export interface CatalogChoice {
@@ -188,6 +190,8 @@ export function sanitizeProjects(hostId: string, projects: readonly T3Project[])
   const sanitized = projects.map((project) => ({
     id: project.id,
     name: project.title,
+    pinned: project.pinnedAt === undefined ? null : project.pinnedAt !== null,
+    archived: project.archivedAt === undefined ? null : project.archivedAt !== null,
     hasDefaultModel: project.defaultModelSelection !== undefined && project.defaultModelSelection !== null,
   }));
   if (JSON.stringify(sanitized).length > MAX_CATALOG_CHARS) throw limit(hostId, 'project catalog text');

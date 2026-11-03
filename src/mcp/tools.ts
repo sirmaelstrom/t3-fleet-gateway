@@ -6,6 +6,7 @@ import { OPERATE_SCOPE, permitsAny, type FleetScope, type Scope } from '../oauth
 
 export interface ToolContext {
   clientId: string;
+  onToolCall?: () => void;
   /** Fleet scopes cover every host; host scopes only their host. Tools check the host of what they touch. */
   scopes: readonly Scope[];
 }
@@ -58,6 +59,7 @@ export function registerTools(server: McpServer, tools: readonly GatewayTool[], 
         annotations: { readOnlyHint: tool.readOnly, openWorldHint: true },
       },
       async (input: unknown) => {
+        context.onToolCall?.();
         const started = performance.now();
         const done = (outcome: 'ok' | 'error', errorCode?: string) =>
           logger.info('mcp.tool_call', {

@@ -2,6 +2,8 @@
 
 Run `t3-fleet-gateway` commands below as `node bin/t3-fleet-gateway.js` from a checkout. Every command accepts `--config`, `--data-dir`, `$T3FG_CONFIG` and `$T3FG_DATA_DIR` (see [configuration.md](configuration.md)). Exit codes are `0` for success, `1` for failure and `2` for usage errors. The CLI shares the running server's database, so CLI changes take effect without a restart.
 
+For a problem you are seeing now, start with [troubleshooting by symptom](troubleshooting.md).
+
 ## Enroll a host
 
 ```sh
@@ -42,7 +44,24 @@ To change an agent's machines, approve it again from the agent (its earlier gran
 
 Codes work once. Five wrong codes lock that approval page (start again from the agent); twenty failures in an hour pause all approvals until the hour clears. Minting a new code with `pair` lifts that pause at once, and `pair` says so when it does.
 
+### Restricting a bot to projects
+
+After connecting the bot, use its id from `clients list`:
+
+```sh
+t3-fleet-gateway clients projects <client-id> --project pilot --project @main/project-1
+t3-fleet-gateway clients projects <client-id>                # inspect
+t3-fleet-gateway clients projects <client-id> --no-projects  # deny every project
+t3-fleet-gateway clients projects <client-id> --all-projects # remove project restrictions
+```
+
+Each change replaces the whole list and takes effect on the next request or notification attempt, without restarting or reissuing tokens. It covers all of that client's OAuth and bearer tokens, including overlapping rotations. Aliases refer to configured projects on their configured host; explicit `@host/projectId` entries come from `fleet_projects` and stay tied to that host/id. For a title-only alias, grant the alias to accept queued work before its id is resolved at dispatch. This ceiling only narrows machine grants; it cannot add machine or Operate access. With no policy the bot retains its existing access. The CLI and private operator dashboard remain unrestricted operator interfaces.
+
+Restricted bots see filtered discovery, jobs, threads, feeds and attention lists, and receive only allowed-project notifications. Notification history aggregates are withheld with `healthAvailable: false`; inspect full delivery health through the operator CLI/dashboard. A policy change prevents later denied deliveries, including retries and replay; it cannot recall a request already sent to a receiver.
+
 ### Agents that only take a bearer token
+
+Inspect token IDs and usage with `clients tokens <client id>`. Rotate using `clients rotate <client id> --token-id <id> --overlap 7d --ttl 1y`, and paste the replacement privately into the bot before the old token's deadline. Overlap must be explicit (0 to 30d); it never extends the old expiry. `clients revoke-token <client id> --token-id <id>` cuts off one token immediately. `clients revoke <client id>` cuts off all its tokens. Counts are authenticated tool calls in the current UTC hour and the last 24 UTC hour buckets, including refused tools; last use is unknown until the first recorded call.
 
 Some agents cannot sign in with OAuth and only offer a bearer token or API key field (Notion's custom MCP connections, for example). Mint a token for one such agent:
 
@@ -245,7 +264,7 @@ This developer tool is separate from the running gateway and `doctor`. It instal
 
 The script uses the existing config and enrolled credentials (`T3FG_CONFIG`, `T3FG_DATA_DIR`, or `--config` / `--data-dir`). It opens the credential database read-only: no schema migrations, credential minting/renewal, job records or configuration writes. It never launches, sends, responds to, interrupts or creates a T3 thread. `--host <id>` restricts the check to one configured host.
 
-It walks all `tools/list` pages with bounds, rejecting repeated cursors, duplicate tools and incomplete discovery. It snapshots the T3 tools used by the gateway (`orchestrator_capabilities` included), selecting `t3_pending_request` when advertised or requiring all three legacy pending-request tools otherwise: input schemas and optional output schemas. It ignores unrelated tools and descriptive annotations, normalizes object/set ordering, and preserves actual field names, defaults and ordered schemas. When schema references make that normalization unsafe, it conservatively retains the full structure; unsupported input references or validation features warn instead of claiming compatibility. Missing required tools fail. The combined tool is checked with list, read and respond samples; absence of the legacy names on a combined-tool host is valid. Compact schemas without null branches on optional fields or explicit `additionalProperties: true` are supported; schema simplifications may still appear as reviewable baseline drift. Other schema changes warn until reviewed; a changed schema is not automatically incompatible. Representative synthetic gateway inputs are validated locally against advertised input schemas, including mutation inputs (launches with the worktree strategy and with `scratch: true`) and long opaque request IDs. Rejected samples fail; schemas the validator cannot assess warn. These samples do not prove all possible inputs or mutation behavior work. MCP discovery and optional output schemas are described in the [MCP tools specification](https://modelcontextprotocol.io/specification/2025-06-18/server/tools).
+It walks all `tools/list` pages with bounds, rejecting repeated cursors, duplicate tools and incomplete discovery. It snapshots the T3 tools used by the gateway (`orchestrator_capabilities` included), selecting `t3_pending_request` when advertised or requiring all three legacy pending-request tools otherwise: input schemas and optional output schemas. It ignores unrelated tools and descriptive annotations, normalizes object/set ordering, and preserves actual field names, defaults and ordered schemas. When schema references make that normalization unsafe, it conservatively retains the full structure; unsupported input references or validation features warn instead of claiming compatibility. Missing required tools fail. The combined tool is checked with list, read and respond samples; absence of the legacy names on a combined-tool host is valid. Compact schemas without null branches on optional fields or explicit `additionalProperties: true` are supported; schema simplifications may still appear as reviewable baseline drift. Other schema changes warn until reviewed; a changed schema is not automatically incompatible. Representative synthetic gateway inputs are validated locally against advertised input schemas, including mutation inputs (launches with the worktree strategy and with `scratch: true`) and long opaque request IDs. Rejected samples fail; schemas the validator cannot assess warn. When `t3_thread_organize` is advertised, its exact `{ threadId, action: "settle" }` input is also validated locally and its schema included in the baseline; the checker never executes settlement and does not require the tool on older hosts. These samples do not prove all possible inputs or mutation behavior work. MCP discovery and optional output schemas are described in the [MCP tools specification](https://modelcontextprotocol.io/specification/2025-06-18/server/tools).
 
 The read-only smoke checks use the existing gateway parsers in a separate MCP session, so discovery cannot change their SDK validation behavior. They read the environment, the capability catalog and up to five projects, try an existing thread in up to three projects (including settled threads), search one project, read one sampled thread in both `messages` and `activity` views with minimal text, and list its pending requests. One pending request is read if present. No thread or pending question available means explicit skipped coverage; the tool does not create work to fill that gap. Output-schema changes are compared, while live output parsing checks the fields consumed by the gateway. Unadvertised output schemas and unobserved states remain unverified.
 

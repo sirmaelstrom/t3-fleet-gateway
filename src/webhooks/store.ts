@@ -1,3 +1,4 @@
+import { allowsProject, expandProjectAccess, projectAccess, projectFilter, projectDenied } from '../oauth/projectAccess.ts';
 import type { CredentialAlertPayload } from '../hosts/alerts.ts';
 import type { GatewayConfig } from '../config.ts';
 import { isThreadLink, threadLink } from '../threadId.js';
@@ -131,7 +132,12 @@ function identityFor(settings: SubscriptionSettings, route: WebhookRoute): strin
 export class WebhookStore {
   readonly #db: Database;
   readonly #clock: Clock;
-  constructor(db: Database, clock: Clock) { this.#db = db; this.#clock = clock; }
+  readonly #projects: GatewayConfig['projects'];
+  constructor(db: Database, clock: Clock, projects: GatewayConfig['projects'] = []) {
+    this.#db = db; this.#clock = clock; this.#projects = projects;
+  }
+
+  #access(clientId: string) { return expandProjectAccess(projectAccess(this.#db, clientId), { projects: this.#projects }); }
 
   /** Only the serving gateway applies config. Opening CLI services must never call this. */
   reconcile(config: WebhooksConfig, dataDir: string): void {
@@ -237,13 +243,48 @@ export class WebhookStore {
   }
 
   /** Called synchronously inside the JobStore event transaction, with the event-time job snapshot. */
+  #projectAllowed(settings: SubscriptionSettings, host: string, alias: string | null, projectId: string | null, jobClient?: string): boolean {
+    const clients = settings.ownerClientId ? [settings.ownerClientId] :
+      jobClient && settings.clients?.includes(jobClient) ? [jobClient] : [];
+    return clients.every((id) => allowsProject(this.#access(id), host, alias, projectId));
+  }
+
+  /** Reauthorize captured payloads at replay, claim and immediately before sending. */
+  #payloadAllowed(settings: SubscriptionSettings, payloadText: string, subscription: { id: string; revision: string }): boolean {
+    const recipients = settings.ownerClientId ? [settings.ownerClientId] : settings.clients ?? [];
+    if (recipients.every((id) => this.#access(id) === undefined)) return true;
+    const payload = JSON.parse(payloadText) as { host: string; jobId?: string; type: string };
+    if (payload.jobId) {
+      const job = this.#db.prepare('SELECT host_id, project_alias, t3_project_id, client_id FROM jobs WHERE id = ?').get(payload.jobId);
+      return !!job && this.#projectAllowed(settings, String(job.host_id), String(job.project_alias),
+        job.t3_project_id as string | null, String(job.client_id));
+    }
+    // Credential notices need one affected job satisfying this connection's filters and current bot policy.
+    const audience = recipients.map((id) => ({ id, filter: projectFilter(this.#access(id), 'j') }));
+    const audienceSql = audience.map(({ filter }) => `(j.client_id = ? AND (${filter.sql}))`).join(' OR ');
+    return !!this.#db.prepare(`SELECT 1 FROM jobs j WHERE j.host_id = ? AND (${audienceSql})
+      AND (? IS NULL OR j.client_id IN (SELECT value FROM json_each(?)))
+      AND (? IS NULL OR j.project_alias IN (SELECT value FROM json_each(?)))
+      AND (? IS NULL OR j.id IN (SELECT value FROM json_each(?)))
+      AND (? IS NULL OR EXISTS (SELECT 1 FROM json_each(?) t WHERE json_extract(t.value, '$.host') = j.host_id
+        AND json_extract(t.value, '$.projectId') = j.t3_project_id))
+      AND (? IS NULL OR EXISTS (SELECT 1 FROM webhook_job_bindings b
+        WHERE b.subscription_id = ? AND b.revision = ? AND b.job_id = j.id
+        AND ? IN (SELECT value FROM json_each(b.events)))) LIMIT 1`)
+      .get(payload.host, ...audience.flatMap(({ id, filter }) => [id, ...filter.params]),
+        settings.clients ? 1 : null, JSON.stringify(settings.clients ?? []),
+        settings.projects ? 1 : null, JSON.stringify(settings.projects ?? []),
+        settings.jobs ? 1 : null, JSON.stringify(settings.jobs ?? []), settings.targets ? 1 : null, JSON.stringify(settings.targets ?? []),
+        settings.ownerClientId ?? null, subscription.id, subscription.revision, payload.type);
+  }
+
   capture(event: JobEvent, job: Job, turnRunId: string | null = job.lastRunId): void {
     const type = eventType(event);
     if (!type) return;
     const rows = this.#db.prepare('SELECT * FROM webhook_subscriptions').all() as unknown as SubscriptionRow[];
     const matches = rows.filter((row) => {
       const s = JSON.parse(row.settings) as SubscriptionSettings;
-      return (!s.targets || s.targets.some((t) => t.host === job.hostId && t.projectId === job.t3ProjectId)) &&
+      return this.#projectAllowed(s, job.hostId, job.projectAlias, job.t3ProjectId, job.clientId) && (!s.targets || s.targets.some((t) => t.host === job.hostId && t.projectId === job.t3ProjectId)) &&
         s.events.includes(type) && (!s.projects || s.projects.includes(job.projectAlias)) && (!s.hosts || s.hosts.includes(job.hostId)) &&
         (!s.jobs || s.jobs.includes(job.id)) && (!s.clients || s.clients.includes(job.clientId)) &&
         (!s.ownerClientId || (s.ownerClientId === job.clientId && this.#bindingMatches(row, job.id, type)));
@@ -300,6 +341,7 @@ export class WebhookStore {
     const rows = this.#db.prepare('SELECT * FROM webhook_subscriptions').all() as unknown as SubscriptionRow[];
     for (const row of rows) {
       const s = JSON.parse(row.settings) as SubscriptionSettings;
+      if (!this.#payloadAllowed(s, JSON.stringify(payload), row)) continue;
       if (!s.events.includes(payload.type) || (s.hosts && !s.hosts.includes(payload.host))) continue;
       // Intersect every route filter. Precise bot/job filters need a single affected ledger job
       // satisfying the entire intersection, rather than borrowing identity from another job.
@@ -351,15 +393,20 @@ export class WebhookStore {
       }
       // One in-flight request per subscription, enforced across DB connections. A failed receiver
       // cannot occupy all sender slots while other subscriptions have work ready.
-      const next = this.#db.prepare(`SELECT d.*, s.route FROM notification_deliveries d JOIN webhook_subscriptions s
+      const next = this.#db.prepare(`SELECT d.*, s.route, s.settings FROM notification_deliveries d JOIN webhook_subscriptions s
         ON s.id = d.subscription_id AND s.revision = d.revision
         WHERE d.state = 'pending' AND d.next_attempt_at <= ? AND NOT EXISTS
           (SELECT 1 FROM notification_deliveries busy WHERE busy.subscription_id = d.subscription_id AND busy.state = 'sending')
         ORDER BY d.next_attempt_at, d.id LIMIT 1`);
       const claims: ClaimedDelivery[] = [];
       for (let n = 0; n < limit; n++) {
-        const row = next.get(now) as (DeliveryRow & { route: string; source: 'job' | 'credential' }) | undefined;
+        const row = next.get(now) as (DeliveryRow & { route: string; settings: string; source: 'job' | 'credential' }) | undefined;
         if (!row) break;
+        if (!this.#payloadAllowed(JSON.parse(row.settings) as SubscriptionSettings, row.payload, { id: row.subscription_id, revision: row.revision })) {
+          this.#db.prepare(`UPDATE ${row.source === 'credential' ? 'credential_deliveries' : 'webhook_deliveries'}
+            SET state = 'cancelled', payload = NULL WHERE id = ?`).run(row.id);
+          continue;
+        }
         const lease = randomUUID();
         this.#db.prepare(`UPDATE ${row.source === 'credential' ? 'credential_deliveries' : 'webhook_deliveries'} SET state = 'sending', lease = ?, lease_until = ?, attempt_count = attempt_count + 1 WHERE id = ?`)
           .run(lease, now + leaseMs, row.id);
@@ -375,8 +422,9 @@ export class WebhookStore {
   }
 
   active(claim: ClaimedDelivery): boolean {
-    return !!this.#db.prepare(`SELECT 1 FROM notification_deliveries d JOIN webhook_subscriptions s ON s.id = d.subscription_id AND s.revision = d.revision
+    const row = this.#db.prepare(`SELECT s.id, s.revision, s.settings, d.payload FROM notification_deliveries d JOIN webhook_subscriptions s ON s.id = d.subscription_id AND s.revision = d.revision
       WHERE d.id = ? AND d.lease = ? AND d.state = 'sending' AND d.source = ?`).get(claim.id, claim.lease, claim.source ?? 'job');
+    return !!row && this.#payloadAllowed(JSON.parse(String(row.settings)) as SubscriptionSettings, String(row.payload), { id: String(row.id), revision: String(row.revision) });
   }
 
   finish(claim: ClaimedDelivery, result: AttemptResult): void {
@@ -438,9 +486,14 @@ export class WebhookStore {
   ownedConnections(caller: NotificationCaller) {
     return this.listConnections().filter((row) => row.ownerClientId === caller.clientId && row.hosts.length > 0 &&
       row.hosts.every((host) => permits(caller.scopes, 'read', host))).map((row) => ({ ...row,
-      health: this.health(row.id)[0]!.health,
+      projects: row.projects.filter((alias) => row.hosts.some((host) => allowsProject(this.#access(caller.clientId), host, alias))),
+      targets: row.targets.filter((t) => allowsProject(this.#access(caller.clientId), t.host, null, t.projectId)),
+      jobs: row.jobs.filter((id) => this.#allowedJob(caller.clientId, id)),
+      healthAvailable: this.#access(caller.clientId) === undefined,
+      health: this.#access(caller.clientId) === undefined ? this.health(row.id)[0]!.health :
+        { lastSuccessAt: null, lastFailureAt: null, failureStreak: 0, deadLettered: 0, pending: 0, overflowCount: 0, replayFloorCursor: '0', oldestReplayAt: null },
       subscriptions: this.#db.prepare('SELECT job_id AS jobId, events FROM webhook_job_bindings WHERE subscription_id = ? AND revision = ? ORDER BY job_id LIMIT ?')
-        .all(row.id, row.revision, MAX_JOB_BINDINGS).map((b) => ({ jobId: String(b.jobId), events: JSON.parse(String(b.events)) as WebhookEventType[] })),
+        .all(row.id, row.revision, MAX_JOB_BINDINGS).filter((b) => this.#allowedJob(caller.clientId, String(b.jobId))).map((b) => ({ jobId: String(b.jobId), events: JSON.parse(String(b.events)) as WebhookEventType[] })),
     }));
   }
 
@@ -452,6 +505,7 @@ export class WebhookStore {
       const hosts = settings.hosts!;
       const job = this.#db.prepare(`SELECT id, project_alias, t3_project_id, host_id FROM jobs WHERE id = ? AND client_id = ?
         AND origin = 'gateway' AND host_id IN (${hosts.map(() => '?').join(',')})`).get(jobId, caller.clientId, ...hosts);
+      if (job && !this.#allowedJob(caller.clientId, jobId)) projectDenied();
       if (!job || (settings.jobs && !settings.jobs.includes(jobId)) || (settings.clients && !settings.clients.includes(caller.clientId)) ||
         (settings.projects && !settings.projects.includes(String(job.project_alias))) ||
         (settings.targets && !settings.targets.some((t) => t.host === job.host_id && t.projectId === job.t3_project_id))) notFound();
@@ -498,8 +552,13 @@ export class WebhookStore {
     const cursor = Number(input.afterCursor ?? 0);
     const since = input.since === undefined ? null : Date.parse(input.since);
     const limit = input.limit ?? 200;
+    const settings = JSON.parse(row.settings) as SubscriptionSettings;
+    const access = settings.ownerClientId ? this.#access(settings.ownerClientId) : undefined;
+    const filter = projectFilter(access, 'j');
     const events = this.#db.prepare(`SELECT * FROM webhook_archive WHERE subscription_id = ? AND revision = ? AND feed_sequence > ?
-      AND (? IS NULL OR created_at >= ?) ORDER BY feed_sequence LIMIT ?`).all(row.id, row.revision, cursor, since, since, limit + 1);
+      AND (? IS NULL OR created_at >= ?) AND ${access === undefined ? '1' : `EXISTS (SELECT 1 FROM jobs j
+        WHERE j.id = json_extract(webhook_archive.payload, '$.jobId') AND (${filter.sql}))`}
+      ORDER BY feed_sequence LIMIT ?`).all(row.id, row.revision, cursor, since, since, ...filter.params, limit + 1);
     const page = events.slice(0, limit);
     let queued = 0;
     let skipped = 0;
@@ -508,6 +567,7 @@ export class WebhookStore {
     let pending = Number(this.#db.prepare("SELECT COUNT(*) AS n FROM notification_deliveries WHERE subscription_id = ? AND state IN ('pending', 'sending')").get(row.id)!.n);
     let blocked = false;
     for (const event of page) {
+      if (!this.#payloadAllowed(settings, String(event.payload), row)) { skipped++; nextCursor = String(event.feed_sequence); continue; }
       const existing = this.#db.prepare('SELECT state FROM webhook_deliveries WHERE subscription_id = ? AND revision = ? AND event_id = ?')
         .get(row.id, row.revision, event.event_id!);
       if (existing?.state === 'pending' || existing?.state === 'sending') { skipped++; nextCursor = String(event.feed_sequence); continue; }
@@ -523,6 +583,11 @@ export class WebhookStore {
     return { queued, skipped, nextCursor, hasMore: blocked || events.length > limit,
       retentionGap: since === null ? cursor < Number(h.archive_floor) :
         since < now - ARCHIVE_RETENTION_MS || (typeof h.archive_floor_at === 'number' && since <= h.archive_floor_at) };
+  }
+
+  #allowedJob(clientId: string, jobId: string): boolean {
+    const filter = projectFilter(this.#access(clientId));
+    return !!this.#db.prepare(`SELECT 1 FROM jobs WHERE id = ? AND (${filter.sql})`).get(jobId, ...filter.params);
   }
 
   #owned(caller: NotificationCaller, id: string): SubscriptionRow {

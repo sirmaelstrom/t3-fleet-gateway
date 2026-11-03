@@ -1,3 +1,4 @@
+import { allowsProject, expandProjectAccess, projectDenied, type ProjectAccess } from '../oauth/projectAccess.ts';
 import { isThreadId } from '../threadId.js';
 import { configuredModel, RUNTIME_MODES, runtimeModeAllowed, type GatewayConfig, type HostConfig, type ProjectConfig } from '../config.ts';
 import { sha256Hex } from '../crypto.ts';
@@ -10,7 +11,7 @@ import { THREAD_READ_SCOPE, THREAD_CONTROL_SCOPE, permits, permittedHosts, type 
 import { T3TransportError, type T3Client } from '../t3/client.ts';
 import { T3ToolError } from '../t3/results.ts';
 import type { ThreadItem, ThreadRead } from '../t3/schemas.ts';
-import { cleanThreadTitle } from '../hosts/threads.ts';
+import { cleanThreadTitle, ThreadCatalog } from '../hosts/threads.ts';
 import { HOUR, SECOND, type Clock } from '../time.ts';
 import { attachmentHashes, validateAttachments, type AttachmentInput } from './attachments.ts';
 import { scanActivity } from './activity.ts';
@@ -262,6 +263,7 @@ export class JobService {
   readonly #config: GatewayConfig;
   readonly #registry: HostRegistry;
   readonly #catalog: CatalogService;
+  readonly #threadCatalog: ThreadCatalog;
   readonly #clock: Clock;
   readonly #logger: Logger;
   /** Set by the running gateway so new work is dispatched without waiting for the next poll. */
@@ -272,8 +274,30 @@ export class JobService {
     this.#config = options.config;
     this.#registry = options.registry;
     this.#catalog = options.catalog;
+    this.#threadCatalog = new ThreadCatalog(options.registry, options.clock, options.logger);
     this.#clock = options.clock;
     this.#logger = options.logger;
+  }
+
+  projectAccess(caller: Pick<Caller, 'clientId'>): ProjectAccess { return expandProjectAccess(this.store.projectAccess(caller.clientId), this.#config); }
+
+  allowsProject(caller: Caller, host: string, alias?: string | null, projectId?: string | null): boolean {
+    return allowsProject(this.projectAccess(caller), host, alias, projectId);
+  }
+
+  /** Check explicit T3 ids, resolving title-only alias grants only when needed. Host authorization comes first. */
+  async authorizeProject(caller: Caller, hostId: string, projectId: string, level: AccessLevel = 'read'): Promise<void> {
+    this.#hostFor(caller, hostId, level);
+    if (this.allowsProject(caller, hostId, null, projectId)) return;
+    const access = this.projectAccess(caller);
+    const titleAliases = this.#config.projects.filter((p) => p.host === hostId && p.t3ProjectId === undefined &&
+      allowsProject(access, hostId, p.alias));
+    if (titleAliases.length) {
+      const catalog = await this.#catalog.projects(hostId);
+      const mapping = mapProjects(this.#config, hostId, catalog.value).get(projectId);
+      if (mapping?.aliases.some((p) => titleAliases.includes(p))) return;
+    }
+    projectDenied();
   }
 
   project(alias: string): ProjectConfig {
@@ -291,14 +315,18 @@ export class JobService {
    */
   #projectFor(caller: Caller, alias: string, level: AccessLevel): ProjectConfig {
     const project = this.#config.projects.find((candidate) => candidate.alias === alias);
-    if (project && permits(caller.scopes, level, project.host)) return project;
+    if (project && (permits(caller.scopes, 'read', project.host) || permits(caller.scopes, level, project.host)) &&
+      !this.allowsProject(caller, project.host, project.alias, project.t3ProjectId)) projectDenied();
+    if (project && permits(caller.scopes, level, project.host)) {
+      return project;
+    }
     if (project && permits(caller.scopes, 'read', project.host)) {
       throw new GatewayError(
         'insufficient_scope',
         `Project "${alias}" is on host ${project.host}, where this agent has read access only. Ask the operator for Operate access on that host.`,
       );
     }
-    const known = this.#config.projects.filter((candidate) => permits(caller.scopes, 'read', candidate.host)).map((candidate) => candidate.alias);
+    const known = this.#config.projects.filter((candidate) => permits(caller.scopes, 'read', candidate.host) && this.allowsProject(caller, candidate.host, candidate.alias, candidate.t3ProjectId)).map((candidate) => candidate.alias);
     throw new GatewayError('not_found', `No project "${alias}". Known projects: ${known.join(', ') || '(none configured)'}. fleet_status lists them.`);
   }
 
@@ -314,7 +342,9 @@ export class JobService {
     const readableHosts = permittedHosts(caller.scopes, 'read');
     const scope = requestedHosts === 'all' || readableHosts === 'all'
       ? {} : { hostIds: [...new Set([...requestedHosts, ...readableHosts])] };
-    const job = this.store.get(jobId, scope);
+    const projects = this.projectAccess(caller);
+    const job = this.store.get(jobId, { ...scope, projects });
+    if (!job && projects !== undefined) projectDenied();
     if (job && permits(caller.scopes, level, job.hostId)) {
       if (job.origin === 'adopted') {
         this.#requireThreadScope(caller, level);
@@ -333,7 +363,7 @@ export class JobService {
   /** The rows of the ledger an agent may read: its grant's hosts, unless it covers all. */
   #visible(caller: Caller, mine = false): JobScope {
     const hosts = permittedHosts(caller.scopes, 'read');
-    return { includeAdopted: caller.scopes.includes(THREAD_READ_SCOPE), ...(mine ? { clientId: caller.clientId } : {}), ...(hosts === 'all' ? {} : { hostIds: hosts }) };
+    return { projects: this.projectAccess(caller), includeAdopted: caller.scopes.includes(THREAD_READ_SCOPE), ...(mine ? { clientId: caller.clientId } : {}), ...(hosts === 'all' ? {} : { hostIds: hosts }) };
   }
 
   #requireThreadScope(caller: Caller, level: AccessLevel): void {
@@ -347,6 +377,16 @@ export class JobService {
     this.store.auditThread(job, caller.clientId, action);
   }
 
+  /** v0.1.6 omits lineage.sideChat from MCP reads; its project list excludes side chats. */
+  async #requireExternalEligibility(host: string, thread: ThreadRead['thread']): Promise<void> {
+    requireExternalEligibility(thread);
+    if (thread.relationshipToParent !== 'fork') return;
+    const listed = await this.#threadCatalog.read(host, thread.projectId, true);
+    if (!listed.value.some((candidate) => candidate.threadId === thread.threadId)) {
+      throw new GatewayError('job_state_conflict', 'This fork is not a listed T3 conversation. Side chats cannot be adopted or resumed; use the parent thread in T3.');
+    }
+  }
+
   /** Imported threads can be reconfigured in T3. Resuming must not bypass the current project or host ceiling. */
   async #validateAdoptedResume(job: Job): Promise<void> {
     if (job.origin !== 'adopted' || job.threadId === null) return;
@@ -356,7 +396,7 @@ export class JobService {
     const { thread } = await this.#registry.client(job.hostId).readThread({
       threadId: job.threadId, view: 'messages', limit: 1, runLimit: 1, maxCharsPerItem: 1,
     });
-    requireExternalEligibility(thread);
+    await this.#requireExternalEligibility(job.hostId, thread);
     if (thread.threadId !== job.threadId || thread.projectId !== job.t3ProjectId) {
       throw new GatewayError('job_state_conflict', 'The imported thread changed project or is no longer a resumable thread. Check it in T3.');
     }
@@ -409,7 +449,7 @@ export class JobService {
     // A retry returns the job of the first request, which the project config may since have moved to another host:
     // the agent must still be allowed to operate on the job's own host. The lookup is limited to those hosts in SQL.
     const hosts = permittedHosts(caller.scopes, 'operate');
-    const scope: JobScope = hosts === 'all' ? {} : { hostIds: hosts };
+    const scope: JobScope = { projects: this.projectAccess(caller), ...(hosts === 'all' ? {} : { hostIds: hosts }) };
     const replayed = key && this.store.get(key.jobId, scope);
     if (key && !replayed) {
       throw new GatewayError(
@@ -426,6 +466,7 @@ export class JobService {
     }
     let project = input.project === undefined ? undefined : this.#projectFor(caller, input.project, 'operate');
     const host = project ? this.#hostFor(caller, project.host, 'operate') : this.#hostFor(caller, input.target!.host, 'operate');
+    if (input.target?.projectId !== undefined) await this.authorizeProject(caller, host.id, input.target.projectId, 'operate');
     const hostOnly = input.target !== undefined && input.target.projectId === undefined;
     if (!host.discovery.enabled && (input.target?.projectId !== undefined || input.modelSelection !== undefined)) {
       throw new GatewayError(
@@ -489,6 +530,7 @@ export class JobService {
         throw error;
       }
     })();
+    if (!this.allowsProject(caller, host.id, spec.alias, spec.projectId)) projectDenied();
     const id = newJobId();
     const result = this.store.create({
       id,
@@ -530,8 +572,8 @@ export class JobService {
   }
 
   #startDisabled(caller: Caller, project: ProjectConfig): GatewayError {
-    const standing = this.store.standingJobs(project.alias).filter((job) =>
-      permits(caller.scopes, 'read', job.hostId) && (job.origin !== 'adopted' || caller.scopes.includes(THREAD_READ_SCOPE)));
+    const standing = this.store.standingJobs(project.alias, this.#visible(caller)).filter((job) =>
+      permits(caller.scopes, 'read', job.hostId) && this.allowsProject(caller, job.hostId, job.projectAlias, job.t3ProjectId) && (job.origin !== 'adopted' || caller.scopes.includes(THREAD_READ_SCOPE)));
     return new GatewayError('start_disabled', startDisabledMessage(project.alias, standing));
   }
 
@@ -613,6 +655,8 @@ export class JobService {
         throw new GatewayError('not_found', `Host ${host.id} has no T3 project ${JSON.stringify(input.target!.projectId)}. fleet_projects lists them.`);
       }
       found = mapping.project;
+      if (!this.allowsProject(caller, host.id, null, mapping.project.id) &&
+        !mapping.aliases.some((p) => this.allowsProject(caller, host.id, p.alias, mapping.project.id))) projectDenied();
       const resolved = launchPolicy(host, mapping);
       if (resolved.kind === 'ambiguous') {
         throw new GatewayError(
@@ -627,7 +671,8 @@ export class JobService {
         alias = resolved.project.alias;
       } else {
         if (!host.discovery.allowWorkStart) {
-          const aliases = this.#config.projects.filter((candidate) => candidate.host === host.id && candidate.allowWorkStart).map((candidate) => candidate.alias);
+          const aliases = this.#config.projects.filter((candidate) => candidate.host === host.id && candidate.allowWorkStart &&
+            this.allowsProject(caller, candidate.host, candidate.alias, candidate.t3ProjectId)).map((candidate) => candidate.alias);
           throw new GatewayError(
             'start_disabled',
             `Host ${host.id} does not accept work_start into T3 projects without a configured alias (discovery.allowWorkStart is false). ` +
@@ -693,7 +738,7 @@ export class JobService {
     };
   }
 
-  list(
+  async list(
     filter: {
       project?: string | undefined;
       target?: { host: string; projectId: string } | undefined;
@@ -702,15 +747,21 @@ export class JobService {
       limit: number;
     },
     caller: Caller,
-  ): Job[] {
+  ): Promise<Job[]> {
     // A configured alias, or the internal ref of a job targeted by T3 project id (@<host>/<projectId>): its host is
     // authorized like any host, and the ref is only a filter on the ledger.
     if (filter.project !== undefined) {
       const ref = parseProjectRef(filter.project);
-      if (ref) this.#hostFor(caller, ref.hostId, 'read');
+      if (ref) {
+        this.#hostFor(caller, ref.hostId, 'read');
+        await this.authorizeProject(caller, ref.hostId, ref.projectId);
+      }
       else this.#projectFor(caller, filter.project, 'read');
     }
-    if (filter.target !== undefined) this.#hostFor(caller, filter.target.host, 'read');
+    if (filter.target !== undefined) {
+      this.#hostFor(caller, filter.target.host, 'read');
+      await this.authorizeProject(caller, filter.target.host, filter.target.projectId);
+    }
     return this.store.list({
       limit: filter.limit,
       ...(filter.project === undefined ? {} : { projectAlias: filter.project }),
@@ -823,7 +874,7 @@ export class JobService {
     if (adoption && (thread.threadId !== input.threadId || thread.projectId !== projectId)) {
       throw new GatewayError('not_found', 'No thread in that project.');
     }
-    if (adoption) requireExternalEligibility(thread);
+    if (adoption) await this.#requireExternalEligibility(project.host, thread);
     if (thread.projectId !== projectId) {
       throw new GatewayError(
         'invalid_argument',
@@ -833,7 +884,7 @@ export class JobService {
     // A launch with a lost response may not have bound its thread id yet. Its gateway marker still owns the thread.
     if (adoption) {
       const marker = /\[job:([a-z0-9]{10})\]/.exec(thread.title)?.[1];
-      const owner = marker && this.store.get(marker, { hostIds: [project.host] });
+      const owner = marker && this.store.get(marker, { hostIds: [project.host], projects: this.projectAccess(adoption) });
       if (owner && owner.origin === 'gateway') throw new GatewayError('job_state_conflict', 'This thread belongs to a gateway launch. Use its existing job.');
     }
     const lastRunId = thread.activeRunId ?? thread.latestRunId;
@@ -886,6 +937,7 @@ export class JobService {
   async adoptExternal(caller: Caller, input: { host: string; projectId: string; threadId: string; requestId: string }): Promise<{ job: Job; created: boolean }> {
     this.#requireThreadScope(caller, 'operate');
     const host = this.#hostFor(caller, input.host, 'operate');
+    await this.authorizeProject(caller, host.id, input.projectId, 'operate');
     if (!isThreadId(input.threadId)) throw new GatewayError('invalid_argument', 'Invalid T3 thread id.');
     const hash = inputHash('work_adopt', { host: input.host, projectId: input.projectId, threadId: input.threadId });
     const key = this.store.idempotencyKey(caller.clientId, 'work_adopt', input.requestId);
@@ -896,8 +948,9 @@ export class JobService {
       return { job, created: false };
     }
     if (!host.discovery.enabled) throw new GatewayError('discovery_disabled', 'Thread adoption needs discovery.enabled on this host.');
-    const existing = this.store.jobForThread(host.id, input.threadId);
-    if (existing && (existing.origin !== 'adopted' || existing.t3ProjectId !== input.projectId)) {
+    const existing = this.store.jobForThread(host.id, input.threadId, { projects: this.projectAccess(caller) });
+    if (existing && existing.t3ProjectId !== input.projectId) throw new GatewayError('not_found', 'No thread in that project.');
+    if (existing && existing.origin !== 'adopted') {
       throw new GatewayError('job_state_conflict', 'This thread already has a gateway or operator-owned job. Use that job with the appropriate scopes.');
     }
     if (existing) {

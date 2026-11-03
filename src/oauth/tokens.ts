@@ -1,6 +1,7 @@
 import { isValidPkceVerifier, pkceChallenge, randomId, randomToken, safeEqual, sha256Hex } from '../crypto.ts';
 import { transaction, type Database } from '../db/database.ts';
-import { DAY, MINUTE, SECOND, type Clock } from '../time.ts';
+import { DAY, HOUR, MINUTE, SECOND, type Clock } from '../time.ts';
+import { GatewayError } from '../errors.ts';
 import { OAuthError } from './errors.ts';
 import { effectiveScopes } from './threadScopes.ts';
 import { formatScope, narrowScopes, parseScope, type Scope } from './scopes.ts';
@@ -30,6 +31,7 @@ export interface TokenResponse {
 }
 
 export interface VerifiedAccessToken {
+  operatorTokenId?: string;
   clientId: string;
   familyId: string;
   scopes: Scope[];
@@ -267,12 +269,13 @@ export class TokenService {
    * registration limit) with one grant and one access token, and no refresh token: it works until it expires
    * or the client is revoked.
    */
-  issueOperatorToken(input: { name: string; scopes: Scope[]; expiresAt: number }): { clientId: string; token: string } {
+  issueOperatorToken(input: { name: string; scopes: Scope[]; expiresAt: number }): { clientId: string; token: string; tokenId: string } {
     const token = randomToken();
     const clientId = randomId(12);
     const familyId = randomId(12);
     const scope = formatScope(input.scopes);
     const now = this.#clock();
+    const tokenId = randomId(12);
     transaction(this.#db, () => {
       this.#db
         .prepare("INSERT INTO oauth_clients (id, name, redirect_uris, created_at, counts_toward_limit) VALUES (?, ?, '[]', ?, 0)")
@@ -287,21 +290,82 @@ export class TokenService {
            VALUES (?, ?, '', ?, ?, ?)`,
         )
         .run(hashToken(token), familyId, scope, now, input.expiresAt);
+      this.#db.prepare('INSERT INTO operator_tokens (id, token_hash) VALUES (?, ?)').run(tokenId, hashToken(token));
     });
-    return { clientId, token };
+    return { clientId, token, tokenId };
+  }
+
+  /** Rotate exactly one operator token; never extend its old expiry or change its grant. */
+  rotateOperatorToken(clientId: string, tokenId: string, overlapMs: number, expiresAt: number): { tokenId: string; token: string } {
+    const now = this.#clock();
+    if (!Number.isSafeInteger(overlapMs) || overlapMs < 0 || overlapMs > 30 * DAY || !Number.isSafeInteger(expiresAt) || expiresAt <= now) {
+      throw new GatewayError('invalid_argument', 'Overlap must be 0 to 30 days and the new expiry must be in the future.');
+    }
+    return transaction(this.#db, () => {
+      const row = this.#db.prepare(`SELECT a.*, f.client_id, f.resource, f.revoked_at AS family_revoked_at,
+        c.revoked_at AS client_revoked_at FROM operator_tokens o JOIN access_tokens a ON a.token_hash = o.token_hash
+        JOIN token_families f ON f.id = a.family_id JOIN oauth_clients c ON c.id = f.client_id
+        WHERE o.id = ? AND f.client_id = ?`).get(tokenId, clientId) as
+        { token_hash: string; family_id: string; scope: string; expires_at: number; revoked_at: number | null;
+          family_revoked_at: number | null; client_revoked_at: number | null; resource: string } | undefined;
+      if (!row || !accessIsUsable(row, now, this.resource)) throw new GatewayError('not_found', 'No usable bearer token with that client and token id.');
+      const token = randomToken();
+      const nextId = randomId(12);
+      this.#db.prepare('UPDATE access_tokens SET expires_at = MIN(expires_at, ?) WHERE token_hash = ?').run(now + overlapMs, row.token_hash);
+      this.#db.prepare(`INSERT INTO access_tokens (token_hash, family_id, refresh_token_hash, scope, created_at, expires_at)
+        VALUES (?, ?, '', ?, ?, ?)`).run(hashToken(token), row.family_id, row.scope, now, expiresAt);
+      this.#db.prepare('INSERT INTO operator_tokens (id, token_hash) VALUES (?, ?)').run(nextId, hashToken(token));
+      return { tokenId: nextId, token };
+    });
+  }
+
+  /** Safe operator inventory: no hashes or secret material. Counts cover UTC hour buckets, including this hour. */
+  operatorTokens(clientId: string): { id: string; createdAt: number; expiresAt: number; revoked: boolean;
+    lastUsedAt: number | null; callsThisHour: number; calls24Hours: number }[] {
+    const hour = Math.floor(this.#clock() / HOUR);
+    return this.#db.prepare(`SELECT o.id, a.created_at AS createdAt, a.expires_at AS expiresAt,
+      (a.revoked_at IS NOT NULL OR f.revoked_at IS NOT NULL OR c.revoked_at IS NOT NULL) AS revoked,
+      o.last_used_at AS lastUsedAt,
+      COALESCE((SELECT SUM(calls) FROM operator_token_calls WHERE token_id = o.id AND hour = ?), 0) AS callsThisHour,
+      COALESCE((SELECT SUM(calls) FROM operator_token_calls WHERE token_id = o.id AND hour BETWEEN ? AND ?), 0) AS calls24Hours
+      FROM operator_tokens o JOIN access_tokens a ON a.token_hash = o.token_hash
+      JOIN token_families f ON f.id = a.family_id JOIN oauth_clients c ON c.id = f.client_id
+      WHERE f.client_id = ? ORDER BY a.created_at, o.id`).all(hour, hour - 23, hour, clientId)
+      .map((row) => ({ ...row, revoked: Boolean(row.revoked) })) as ReturnType<TokenService['operatorTokens']>;
+  }
+
+  revokeOperatorToken(clientId: string, tokenId: string): void {
+    const result = this.#db.prepare(`UPDATE access_tokens SET revoked_at = COALESCE(revoked_at, ?) WHERE token_hash IN
+      (SELECT o.token_hash FROM operator_tokens o JOIN access_tokens a ON a.token_hash = o.token_hash
+       JOIN token_families f ON f.id = a.family_id WHERE o.id = ? AND f.client_id = ?)`).run(this.#clock(), tokenId, clientId);
+    if (!result.changes) throw new GatewayError('not_found', 'No bearer token with that client and token id.');
+  }
+
+  /** Count authenticated, schema-valid tool invocations, including refused or failed calls; never protocol handshakes. */
+  recordOperatorCall(tokenId: string): void {
+    const now = this.#clock();
+    const hour = Math.floor(now / HOUR);
+    transaction(this.#db, () => {
+      this.#db.prepare('UPDATE operator_tokens SET last_used_at = ? WHERE id = ?').run(now, tokenId);
+      this.#db.prepare('DELETE FROM operator_token_calls WHERE hour < ?').run(hour - 23);
+      this.#db.prepare(`INSERT INTO operator_token_calls (token_id, hour, calls) VALUES (?, ?, 1)
+        ON CONFLICT (token_id, hour) DO UPDATE SET calls = calls + 1`).run(tokenId, hour);
+    });
   }
 
   /** Returns the token's grant, or undefined when it is unknown, expired, revoked or for another resource. */
   verifyAccessToken(token: string): VerifiedAccessToken | undefined {
     const row = this.#db
       .prepare(
-        `SELECT a.scope, a.expires_at, a.revoked_at, a.family_id, f.client_id, f.resource,
+        `SELECT o.id AS operator_token_id, a.scope, a.expires_at, a.revoked_at, a.family_id, f.client_id, f.resource,
                 f.revoked_at AS family_revoked_at, c.revoked_at AS client_revoked_at
            FROM access_tokens a JOIN token_families f ON f.id = a.family_id JOIN oauth_clients c ON c.id = f.client_id
+           LEFT JOIN operator_tokens o ON o.token_hash = a.token_hash
            WHERE a.token_hash = ?`,
       )
       .get(hashToken(token)) as
       | {
+          operator_token_id: string | null;
           scope: string;
           expires_at: number;
           revoked_at: number | null;
@@ -315,6 +379,7 @@ export class TokenService {
     if (!row) return undefined;
     if (!accessIsUsable(row, this.#clock(), this.#settings.resource)) return undefined;
     return {
+      ...(row.operator_token_id ? { operatorTokenId: row.operator_token_id } : {}),
       clientId: row.client_id,
       familyId: row.family_id,
       scopes: effectiveScopes(this.#db, row.client_id, parseScope(row.scope) ?? []),

@@ -1,3 +1,4 @@
+import { projectAccess, projectFilter, type ProjectAccess } from '../oauth/projectAccess.ts';
 import { randomUUID } from 'node:crypto';
 import { validateAttachments, type AttachmentInput } from './attachments.ts';
 import { sha256Hex } from '../crypto.ts';
@@ -284,6 +285,7 @@ const MINE = '(jobs.client_id = ? OR jobs.standing = 1)';
  * so jobs the agent may not see never take a place on its page.
  */
 export interface JobScope {
+  projects?: ProjectAccess;
   clientId?: string | undefined;
   /** Operator standing jobs retain host-grant access; only client imports require the extra read opt-in. */
   includeAdopted?: boolean | undefined;
@@ -304,6 +306,9 @@ function scopeClause(scope: JobScope): { sql: string; params: string[] } {
     parts.push(scope.hostIds.length === 0 ? '0' : `jobs.host_id IN (${scope.hostIds.map(() => '?').join(', ')})`);
     params.push(...scope.hostIds);
   }
+  const projects = projectFilter(scope.projects);
+  parts.push(`(${projects.sql})`);
+  params.push(...projects.params);
   if (scope.target !== undefined) {
     parts.push('jobs.host_id = ? AND jobs.t3_project_id = ?');
     params.push(scope.target.hostId, scope.target.projectId);
@@ -520,11 +525,11 @@ export class JobStore {
   /** Jobs whose unreadable launch spec this process has already reported: once per job, not once per read. */
   readonly #reportedUnreadable = new Set<string>();
 
-  constructor(db: Database, clock: Clock, logger: Logger) {
+  constructor(db: Database, clock: Clock, logger: Logger, webhooks = new WebhookStore(db, clock)) {
     this.#db = db;
     this.#clock = clock;
     this.#logger = logger;
-    this.#webhooks = new WebhookStore(db, clock);
+    this.#webhooks = webhooks;
   }
 
   /** A job from its row. A launch spec that cannot be read is flagged on the job and reported (ids and state only, never the text). */
@@ -536,6 +541,10 @@ export class JobStore {
     }
     return job;
   };
+
+  projectAccess(clientId: string): ProjectAccess {
+    return projectAccess(this.#db, clientId);
+  }
 
   get(id: string, scope: JobScope = {}): Job | undefined {
     const filter = scopeClause(scope);
@@ -623,9 +632,10 @@ export class JobStore {
   }
 
   /** Any recorded owner, including finished gateway jobs and released adoptions; thread ids are host-local. */
-  jobForThread(hostId: string, threadId: string): Job | undefined {
-    const row = this.#db.prepare('SELECT * FROM jobs WHERE host_id = ? AND t3_thread_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1')
-      .get(hostId, threadId) as JobRow | undefined;
+  jobForThread(hostId: string, threadId: string, scope: JobScope = {}): Job | undefined {
+    const filter = scopeClause(scope);
+    const row = this.#db.prepare(`SELECT * FROM jobs WHERE host_id = ? AND t3_thread_id = ? ${filter.sql} ORDER BY created_at DESC, rowid DESC LIMIT 1`)
+      .get(hostId, threadId, ...filter.params) as JobRow | undefined;
     return row && this.#job(row);
   }
 
@@ -638,11 +648,12 @@ export class JobStore {
   }
 
   /** Open standing jobs, oldest first; all of them, or one project's. */
-  standingJobs(projectAlias?: string): Job[] {
+  standingJobs(projectAlias?: string, scope: JobScope = {}): Job[] {
+    const filter = scopeClause(scope);
     const project = projectAlias === undefined ? '' : 'AND project_alias = ?';
     const rows = this.#db
-      .prepare(`SELECT * FROM jobs WHERE standing = 1 AND state NOT IN (${NOT_OPEN}) ${project} ORDER BY created_at, rowid`)
-      .all(...TERMINAL_STATES, ...(projectAlias === undefined ? [] : [projectAlias])) as unknown as JobRow[];
+      .prepare(`SELECT * FROM jobs WHERE standing = 1 AND state NOT IN (${NOT_OPEN}) ${project} ${filter.sql} ORDER BY created_at, rowid`)
+      .all(...TERMINAL_STATES, ...(projectAlias === undefined ? [] : [projectAlias]), ...filter.params) as unknown as JobRow[];
     return rows.map(this.#job);
   }
 

@@ -1,3 +1,4 @@
+import { setProjectAccess } from '../src/oauth/projectAccess.ts';
 import assert from 'node:assert/strict';
 import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -261,4 +262,94 @@ test('restart after an abandoned lease and expired window counts the dead letter
   f.store.finish(lost, { outcome: 'delivered', statusCode: 204 });
   assert.equal(restarted.health()[0]!.health.deadLettered, 1);
   assert.equal(restarted.health()[0]!.health.lastSuccessAt, null);
+});
+
+test('project allowlists filter capture, queued delivery, replay, connection metadata and subscriptions', (t) => {
+  const f = fixture(t, { ownerClientId: owner.clientId, hosts: ['main'], projects: ['pilot', 'hidden'] });
+  f.db.prepare("INSERT INTO oauth_clients (id, name, redirect_uris, created_at) VALUES (?, 'Bot', '[]', 1)").run(owner.clientId);
+  f.create('allowed1');
+  f.create('hidden01', { projectAlias: 'hidden', t3ProjectId: 'project-hidden' });
+  f.store.subscribe(owner, 'bot', 'allowed1');
+  f.store.subscribe(owner, 'bot', 'hidden01');
+  f.cancel('hidden01');
+  const inFlight = f.store.claim(1, 30_000)[0]!;
+  assert.ok(inFlight);
+  setProjectAccess(f.db, owner.clientId, [{ host: 'main', alias: 'pilot', projectId: 'project-1' }]);
+  assert.equal(f.store.active(inFlight), false, 'claimed payload rechecked before POST');
+  f.clock.advance(30_000);
+  assert.deepEqual(f.store.claim(4, 30_000), [], 'denied queued event is cancelled');
+  assert.equal(f.db.prepare('SELECT state FROM webhook_deliveries WHERE event_id = ?').get(inFlight.eventId)!.state, 'cancelled');
+  f.create('hidden02', { projectAlias: 'hidden', t3ProjectId: 'project-hidden' });
+  assert.throws(() => f.store.subscribe(owner, 'bot', 'hidden02'), { code: 'insufficient_scope' });
+  f.cancel('hidden02');
+  assert.equal(f.db.prepare('SELECT COUNT(*) AS n FROM webhook_archive').get()!.n, 1, 'new denied events are never archived');
+  f.cancel('allowed1');
+  const allowed = f.store.claim(4, 30_000);
+  assert.equal(allowed.length, 1);
+  assert.equal(JSON.parse(allowed[0]!.payload).jobId, 'allowed1');
+  f.store.finish(allowed[0]!, { outcome: 'delivered', statusCode: 204 });
+  const replay = f.store.replayOwned(owner, 'bot', { afterCursor: '0', limit: 1 });
+  assert.equal(replay.queued, 1, 'filter before page limit reaches allowed archive after denied event');
+  assert.equal(replay.hasMore, false);
+  const view = f.store.ownedConnections(owner)[0]!;
+  assert.deepEqual(view.projects, ['pilot']);
+  assert.deepEqual(view.subscriptions.map((s) => s.jobId), ['allowed1']);
+  assert.equal(view.healthAvailable, false, 'cross-project aggregate history withheld');
+  assert.ok(!JSON.stringify(view).includes('hidden'));
+  setProjectAccess(f.db, owner.clientId, []);
+  assert.deepEqual(f.store.claim(4, 30_000), []);
+  assert.equal(f.store.replayOwned(owner, 'bot', { afterCursor: '0' }).queued, 0);
+});
+
+test('client-filtered webhook routes also respect the selected bot project policy', (t) => {
+  const f = fixture(t, { clients: [owner.clientId] });
+  f.db.prepare("INSERT INTO oauth_clients (id, name, redirect_uris, created_at) VALUES (?, 'Bot', '[]', 1)").run(owner.clientId);
+  setProjectAccess(f.db, owner.clientId, [{ host: 'main', alias: 'pilot' }]);
+  f.create('hidden03', { projectAlias: 'hidden' }); f.cancel('hidden03');
+  f.create('allowed2'); f.cancel('allowed2');
+  const deliveries = f.store.claim(4, 30_000);
+  assert.equal(deliveries.length, 1);
+  assert.equal(JSON.parse(deliveries[0]!.payload).jobId, 'allowed2');
+});
+
+test('credential notices need an allowed affected job for both bot-owned and client-filtered routes', (t) => {
+  for (const settings of [{ ownerClientId: owner.clientId, hosts: ['main'] }, { clients: [owner.clientId] }]) {
+    const f = fixture(t, { ...settings, events: ['credential_alert', 'cancelled'] });
+    f.db.prepare("INSERT INTO oauth_clients (id, name, redirect_uris, created_at) VALUES (?, 'Bot', '[]', 1)").run(owner.clientId);
+    f.create('hidden04', { projectAlias: 'hidden', t3ProjectId: 'project-hidden' });
+    if ('ownerClientId' in settings) f.store.subscribe(owner, 'bot', 'hidden04');
+    setProjectAccess(f.db, owner.clientId, [{ host: 'main', alias: 'pilot' }]);
+    const notice = { eventId: 'synthetic-credential-1', type: 'credential_alert' as const, timestamp: new Date(f.clock()).toISOString(),
+      feedSequence: null, feedCursor: null, host: 'main', reason: 'renewal_failed' as const, thresholdDays: null, expiresAt: null, alertId: 'synthetic-alert' };
+    f.store.captureCredential(notice, []);
+    assert.deepEqual(f.store.claim(4, 30_000), [], 'a job in a denied project cannot authorize host alerts');
+    f.create('allowed3');
+    if ('ownerClientId' in settings) f.store.subscribe(owner, 'bot', 'allowed3');
+    f.store.captureCredential({ ...notice, eventId: 'synthetic-credential-2' }, []);
+    const delivery = f.store.claim(4, 30_000);
+    assert.equal(delivery.length, 1);
+    setProjectAccess(f.db, owner.clientId, []);
+    assert.equal(f.store.active(delivery[0]!), false, 'credential notices are also reauthorized before POST');
+  }
+});
+
+test('gateway capture shares alias expansion for id-approved jobs cancelled before dispatch', async (t) => {
+  const { startJobHarness, startJob, agentWithToken } = await import('./helpers/jobs.ts');
+  const { NEVER_EXPIRES } = await import('../src/oauth/tokens.ts');
+  const h = await startJobHarness(t, { host: { discovery: { enabled: true } }, webhookSender: { autoStart: false } });
+  const { tokens, db, webhooks } = h.gw.services;
+  const minted = tokens.issueOperatorToken({ name: 'Queued bot', scopes: ['fleet:read', 'fleet:operate'], expiresAt: NEVER_EXPIRES });
+  writeFileSync(join(h.gw.dataDir, 'synthetic.key'), 'synthetic-key', { mode: 0o600 });
+  const config = webhooksSchema.parse({ subscriptions: [{ id: 'queued', enabled: true, url: 'https://receiver.example.com/event',
+    auth: { header: 'Authorization', secretFile: 'synthetic.key' }, hosts: ['main'], ownerClientId: minted.clientId, events: ['cancelled'] }] });
+  webhooks.reconcile(config, h.gw.dataDir);
+  setProjectAccess(db, minted.clientId, [{ host: 'main', projectId: 'project-1' }]);
+  const bot = await agentWithToken(t, h.gw.baseUrl, minted.clientId, minted.token);
+  const job = await startJob(bot);
+  await bot.call('work_subscribe', { connectionId: 'queued', jobId: job.jobId });
+  await bot.call('work_cancel', { jobId: job.jobId });
+  const delivery = webhooks.claim(4, 30_000);
+  assert.equal(delivery.length, 1);
+  assert.equal(JSON.parse(delivery[0]!.payload).jobId, job.jobId);
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM webhook_archive').get()!.n, 1);
 });

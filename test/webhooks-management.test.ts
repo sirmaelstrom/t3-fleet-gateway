@@ -69,7 +69,7 @@ function access(gw: TestGateway) {
     async list() {
       const result = await raw(port, '/fleet/api/webhooks', 'GET', API);
       assert.equal(result.status, 200, result.text);
-      return JSON.parse(result.text) as { session: string; projects: { alias: string; host: string }[]; connections: WebhookConnection[] };
+      return JSON.parse(result.text) as { session: string; projects: { alias: string; host: string }[]; connections: (WebhookConnection & { displayName: string })[] };
     },
     async post(action: string, body: Record<string, unknown>) {
       const result = await raw(port, `/fleet/api/webhooks/${action}`, 'POST', headers, JSON.stringify(body));
@@ -95,7 +95,7 @@ const actionInput = (session: string, row: WebhookConnection) => ({ session, req
 describe('private webhook connection management', () => {
   test('setup persists defaults and never exports or logs route/header/response; empty-config sender wakes', async (t) => {
     const f = await fixture(t, true);
-    assert.deepEqual((await f.api.list()).projects, [{ alias: 'pilot', host: 'main' }]);
+    assert.deepEqual((await f.api.list()).projects, [{ alias: 'pilot', host: 'main', projectId: 'project-1', label: 'pilot' }]);
     const { connection } = await connect(f);
     assert.equal(connection.source, 'dashboard');
     assert.equal(connection.lastTest!.statusCode, 202);
@@ -452,4 +452,91 @@ test('event-filter replacement tests before commit and preserves precise filters
   assert.deepEqual(after.clients, before.clients);
   assert.deepEqual(after.targets, before.targets);
   assert.notEqual(after.revision, before.revision);
+});
+
+
+test('connection display names resolve on the gateway at read time by host and project ID', async (t) => {
+  const { startFakeT3 } = await import('./helpers/fakeT3.ts');
+  const host = await startFakeT3(); t.after(() => host.close());
+  const gw = await startTestGateway(t, {
+    config: { ...CONFIG, hosts: [{ id: 'main', t3Url: host.url, mintPairingCode: host.mintCommand(), discovery: { enabled: true } }] },
+    jobEngine: { autoStart: false }, webhookSender: { autoStart: false },
+  });
+  await gw.services.registry.enroll('main');
+  const route = { url: 'https://receiver.example.test/hook', header: 'authorization', value: 'synthetic-key' };
+  const ping = { eventId: randomUUID(), at: gw.clock(), result: { outcome: 'delivered' as const, statusCode: 202 } };
+  const store = gw.services.webhooks;
+  store.connectDashboard('paired', '', 'main', route, ping, 'project-1');
+  store.connectDashboard('named', '', 'main', route, ping, 'project-2');
+  store.connectDashboard('unknown', '', 'main', route, ping, 'missing-project');
+  store.connectDashboard('other-host', '', 'other', route, ping, 'project-1');
+  store.connectDashboard('legacy', 'pilot', 'main', route, ping);
+  const api = access(gw);
+  const names = async () => Object.fromEntries((await api.list()).connections.map((row) => [row.id, row.displayName]));
+  const first = await names();
+  assert.equal(first.paired, 'pilot');
+  assert.equal(first.named, 'Synthetic project 2');
+  assert.equal(first.unknown, 'missing-project');
+  assert.equal(first['other-host'], 'project-1', 'same ID on another host must not borrow an alias or name');
+  assert.equal(first.legacy, 'pilot');
+  const before = store.listConnections();
+  gw.services.config.projects[0]!.alias = 'renamed';
+  assert.equal((await names()).paired, 'renamed', 'read current config, not a name saved at connection creation');
+  gw.services.config.projects = [];
+  assert.equal((await names()).paired, 'Synthetic project 1');
+  assert.deepEqual(store.listConnections(), before, 'display names never rewrite connection settings or revisions');
+  await gw.gateway.close();
+  const restarted = await startTestGateway(t, {
+    dataDir: gw.dataDir, door: gw.door,
+    config: { ...CONFIG, projects: [{ ...CONFIG.projects[0], alias: 'after-restart' }] },
+    jobEngine: { autoStart: false }, webhookSender: { autoStart: false },
+  });
+  const refreshed = (await access(restarted).list()).connections;
+  assert.equal(refreshed.find((row) => row.id === 'paired')!.displayName, 'after-restart');
+  assert.equal(refreshed.find((row) => row.id === 'named')!.displayName, 'project-2', 'unavailable discovery falls back to ID');
+  assert.deepEqual(restarted.services.webhooks.listConnections(), before);
+});
+
+
+test('project options deduplicate aliases and compute readable labels with same-host collision suffixes', async (t) => {
+  const { startFakeT3 } = await import('./helpers/fakeT3.ts');
+  const host = await startFakeT3(); t.after(() => host.close());
+  host.projects.splice(0, host.projects.length,
+    { ...host.projects[0]!, id: 'aliased-id', title: 'Discovered alias name' },
+    { ...host.projects[0]!, id: 'unique-id', title: 'Readable name' },
+    { ...host.projects[0]!, id: 'collision-a', title: 'Shared' },
+    { ...host.projects[0]!, id: 'collision-b', title: 'Shared' },
+    { ...host.projects[0]!, id: 'alias-collision', title: 'configured' },
+    { ...host.projects[0]!, id: 'title-only-id', title: 'title-alias' },
+  );
+  const gw = await startTestGateway(t, {
+    config: { ...CONFIG,
+      hosts: ['main', 'other'].map((id) => ({ id, t3Url: host.url, mintPairingCode: host.mintCommand(), discovery: { enabled: true } })),
+      projects: [
+        { alias: 'configured', host: 'main', t3ProjectId: 'aliased-id' },
+        { alias: 'second-binding', host: 'main', t3ProjectId: 'aliased-id' },
+        { alias: 'title-alias', host: 'main', t3ProjectTitle: 'Title-selected project' },
+      ],
+    }, jobEngine: { autoStart: false }, webhookSender: { autoStart: false },
+  });
+  await gw.services.registry.enroll('main');
+  await gw.services.registry.enroll('other');
+  const list = await access(gw).list();
+  const options = list.projects as { alias: string; host: string; projectId?: string; label: string }[];
+  const main = options.filter((p) => p.host === 'main');
+  assert.equal(main.length, 7, 'each pinned project appears once, plus the title-based alias with no known ID');
+  assert.equal(main.some((p) => p.alias === 'second-binding'), false, 'first configured binding represents a shared project');
+  assert.equal(main.find((p) => p.alias === 'title-alias')!.label, 'title-alias');
+  assert.equal(main.find((p) => p.projectId === 'title-only-id')!.label, 'title-alias (title-on)');
+  assert.equal(main.find((p) => p.projectId === 'aliased-id')!.alias, 'configured', 'keep alias selection semantics');
+  assert.equal(main.find((p) => p.projectId === 'aliased-id')!.label, 'configured (aliased-)');
+  assert.equal(main.find((p) => p.projectId === 'alias-collision')!.label, 'configured (alias-co)');
+  assert.equal(main.find((p) => p.projectId === 'unique-id')!.label, 'Readable name');
+  assert.equal(main.find((p) => p.projectId === 'collision-a')!.label, 'Shared (collision-a)');
+  assert.equal(main.find((p) => p.projectId === 'collision-b')!.label, 'Shared (collision-b)');
+  const other = options.filter((p) => p.host === 'other');
+  assert.equal(other.length, 6, 'alias on another host never hides a discovered project');
+  assert.equal(other.find((p) => p.projectId === 'aliased-id')!.label, 'Discovered alias name');
+  assert.equal(other.find((p) => p.projectId === 'alias-collision')!.label, 'configured', 'collisions on another host do not add a suffix');
+  assert.equal(other.find((p) => p.projectId === 'unique-id')!.label, 'Readable name', 'same label across hosts needs no suffix');
 });

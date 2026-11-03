@@ -432,7 +432,7 @@ test('migration 15 preserves populated v14 subscriptions, secrets, revisions, qu
   assert.equal(schemaVersion(db), SCHEMA_VERSION);
   assert.deepEqual(tables.map((table) => db.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all()), before);
   assert.deepEqual(webhooks.route(connection.id, connection.revision), dashboardRoute);
-  assert.throws(() => migrate(db, MIGRATIONS.slice(0, 14)), /schema version 19 is newer/);
+  assert.throws(() => migrate(db, MIGRATIONS.slice(0, 14)), /schema version \d+ is newer/);
   assert.equal(webhooks.claim(1, 30_000).length, 1, 'pending delivery still dispatches');
 });
 

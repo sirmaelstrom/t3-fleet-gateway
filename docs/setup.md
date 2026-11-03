@@ -1,6 +1,8 @@
 # Manual setup
 
-Follow these steps yourself or give them to a coding agent on the gateway machine. They expand the [README's quick start](../README.md#quick-start). See [configuration](configuration.md) for fields and [operations](operations.md) for maintenance and recovery.
+Follow these steps yourself or give them to a coding agent on the gateway machine. They expand the [README's prompt-based setup](../README.md#set-up-with-prompts). See [configuration](configuration.md) for fields and [operations](operations.md) for maintenance and recovery.
+
+Having trouble along the way? Use the [symptom-based troubleshooting guide](troubleshooting.md).
 
 ## Before you start
 
@@ -94,6 +96,24 @@ node bin/t3-fleet-gateway.js clients revoke <client-id>
 ```
 
 A network outage and expired credentials are different problems. Keep the client's saved OAuth credentials and `work_feed.nextCursor` while restoring connectivity. Follow [authentication and outage recovery](operations.md#authentication-and-outage-recovery); longer token lifetimes do not restart a disabled bot routine.
+
+## Let a bot adopt T3 threads
+
+To let a connected bot find and adopt threads you started directly in T3 (`fleet_threads`, `work_adopt`), turn on discovery for that host and restart the service. Leave `discovery.allowWorkStart` false unless bots should also launch into T3 projects that have no alias:
+
+```json
+"discovery": { "enabled": true, "allowWorkStart": false }
+```
+
+Then grant the bot both thread scopes:
+
+```sh
+node bin/t3-fleet-gateway.js clients list
+node bin/t3-fleet-gateway.js clients grant <client-id> --scope threads:read --scope threads:control
+node bin/t3-fleet-gateway.js clients scopes <client-id>
+```
+
+The change applies on the bot's next request with its existing token. `clients ungrant <client-id> --scope …` removes it. See [external thread discovery and adoption](design.md#external-thread-discovery-and-adoption).
 
 ## Add the private dashboard
 

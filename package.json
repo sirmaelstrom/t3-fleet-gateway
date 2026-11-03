@@ -1,6 +1,6 @@
 {
   "name": "t3-fleet-gateway",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "private": true,
   "description": "Let hosted AI agents hand coding work to your own T3 Code servers over MCP, with OAuth and a durable job ledger.",
   "license": "MIT",

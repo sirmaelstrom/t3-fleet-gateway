@@ -556,3 +556,38 @@ test('a lost launch response with an unfamiliar T3 id reconciles without launchi
   assert.equal(stored.threadLink, null);
   assert.equal(h.fake.launches.length, 1);
 });
+
+test('side chats are hidden from discovery and cannot be adopted by id; ordinary forks remain adoptable', async (t) => {
+  const h = await startJobHarness(t, { host: { discovery: { enabled: true } } });
+  grant(h);
+  const sideChat = external(h, 'Synthetic side chat');
+  Object.assign(h.fake.threads.get(sideChat)!, { sideChat: true, relationshipToParent: 'fork' });
+  const fork = external(h, 'Synthetic ordinary fork');
+  h.fake.threads.get(fork)!.relationshipToParent = 'fork';
+  const page = await h.agent.call<Page>('fleet_threads', target);
+  assert.deepEqual(page.threads.map((thread) => thread.threadId), [fork]);
+  assert.equal((await h.agent.callError('work_adopt', { ...target, threadId: sideChat, requestId: 'side-chat' })).code, 'job_state_conflict');
+  const { job } = await h.agent.call<Adoption>('work_adopt', { ...target, threadId: fork, requestId: 'ordinary-fork' });
+  const readsBeforeWatch = h.fake.reads.length;
+  await h.tick();
+  assert.deepEqual(h.gw.services.jobs.store.onHost('main', ['running']).map((row) => row.id), [job.jobId]);
+  assert.ok(!h.fake.reads.slice(readsBeforeWatch).some((read) => read.threadId === sideChat), 'watcher never imports hidden side chats');
+  // Even a direct id must be checked again before a resume; the earlier list snapshot is insufficient.
+  h.fake.finishTurn(fork, 'Synthetic fork reply');
+  await h.tick();
+  h.fake.threads.get(fork)!.sideChat = true;
+  const sends = h.fake.calls.filter((call) => call === 't3_thread_send').length;
+  assert.equal((await h.agent.callError('work_continue', { jobId: job.jobId, message: 'Synthetic', requestId: 'hidden-fork' })).code, 'job_state_conflict');
+  assert.equal(h.fake.calls.filter((call) => call === 't3_thread_send').length, sends);
+});
+
+test('project organization is additive and flags archived projects without changing configured launch policy', async (t) => {
+  const h = await startJobHarness(t, { host: { discovery: { enabled: true } } });
+  Object.assign(h.fake.projects[0]!, { pinnedAt: '2026-10-31T00:00:00.000Z', archivedAt: '2026-10-31T01:00:00.000Z' });
+  Object.assign(h.fake.projects[1]!, { pinnedAt: null, archivedAt: null });
+  const result = await h.agent.call<{ hosts: { projects: { projectId: string; pinned: boolean | null; archived: boolean | null; guidance: string; launch: { allowed: boolean } }[] }[] }>('fleet_projects', { host: 'main' });
+  const projects = result.hosts[0]!.projects;
+  assert.deepEqual(projects.map((project) => [project.pinned, project.archived]), [[true, true], [false, false], [null, null]]);
+  assert.equal(projects[0]!.launch.allowed, true, 'organization does not change the operator policy');
+  assert.match(projects[0]!.guidance, /Archived in T3/);
+});

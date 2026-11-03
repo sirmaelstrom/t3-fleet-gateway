@@ -476,6 +476,33 @@ CREATE VIEW notification_deliveries AS
   SELECT *, 'job' AS source FROM webhook_deliveries UNION ALL
   SELECT *, 'credential' AS source FROM credential_deliveries;`,
   },
+  {
+    version: 20,
+    name: 'operator token rotation and usage',
+    sql: `CREATE TABLE operator_tokens (
+  id TEXT PRIMARY KEY,
+  token_hash TEXT NOT NULL UNIQUE REFERENCES access_tokens(token_hash) ON DELETE CASCADE,
+  last_used_at INTEGER
+) STRICT;
+INSERT INTO operator_tokens (id, token_hash)
+  SELECT lower(hex(randomblob(12))), a.token_hash FROM access_tokens a
+  JOIN token_families f ON f.id = a.family_id JOIN oauth_clients c ON c.id = f.client_id
+  WHERE a.refresh_token_hash = '' AND c.redirect_uris = '[]';
+CREATE TABLE operator_token_calls (
+  token_id TEXT NOT NULL REFERENCES operator_tokens(id) ON DELETE CASCADE,
+  hour INTEGER NOT NULL,
+  calls INTEGER NOT NULL,
+  PRIMARY KEY (token_id, hour)
+) STRICT;`,
+  },
+  {
+    version: 21,
+    name: 'per-client project access',
+    sql: `CREATE TABLE client_project_access (
+  client_id TEXT PRIMARY KEY REFERENCES oauth_clients(id) ON DELETE CASCADE,
+  projects TEXT NOT NULL
+) STRICT;`,
+  },
 ];
 
 /**
