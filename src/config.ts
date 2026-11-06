@@ -99,6 +99,11 @@ const hostSchema = z.strictObject({
   defaultModelSelection: modelSelectionSchema.nullable().default(null),
   defaultProject: z.string().min(1).max(64).optional(),
   discovery: discoverySchema.default(DEFAULT_DISCOVERY),
+  /**
+   * false: the fleet scopes (`fleet:read`, `fleet:operate`) do not cover this host, so only a grant naming it
+   * (`host:<id>:read|operate`) reaches it. Fleet-wide grants keep every other host.
+   */
+  fleetScopes: z.boolean().default(true),
 });
 
 const projectSchema = z

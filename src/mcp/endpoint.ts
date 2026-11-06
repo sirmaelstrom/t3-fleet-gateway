@@ -12,6 +12,7 @@ import { exchangeSignal, sendWebResponse, toWebRequest } from '../http/web.ts';
 import type { Logger } from '../log.ts';
 import type { ClientStore } from '../oauth/clients.ts';
 import { resourceMetadataUrl } from '../oauth/metadata.ts';
+import { scopesOnHosts, type Scope } from '../oauth/scopes.ts';
 import type { TokenService, VerifiedAccessToken } from '../oauth/tokens.ts';
 import { GATEWAY_NAME, GATEWAY_VERSION } from '../version.ts';
 import { registerTools, type GatewayTool, type ToolContext } from './tools.ts';
@@ -25,6 +26,8 @@ export interface McpEndpointDependencies {
   tokens: TokenService;
   clients: ClientStore;
   tools: readonly GatewayTool[];
+  /** The configured hosts; one with `fleetScopes: false` is reached only by a grant that names it. */
+  hosts: readonly { id: string; fleetScopes: boolean }[];
   logger: Logger;
 }
 
@@ -58,7 +61,8 @@ export function createMcpEndpoint(deps: McpEndpointDependencies): { route: Route
         try { deps.tokens.recordOperatorCall(id); } catch { logger.warn('mcp.token_usage_record_failed'); }
       }
     },
-    scopes: (authInfo?.scopes ?? []) as ToolContext['scopes'],
+    // Every tool authorizes from these, so a host outside the fleet scopes is invisible to fleet-wide grants.
+    scopes: scopesOnHosts((authInfo?.scopes ?? []) as Scope[], deps.hosts),
   });
   const modern = createMcpHandler(({ authInfo }) => buildServer(contextFrom(authInfo)), {
     legacy: 'reject',

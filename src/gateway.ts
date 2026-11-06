@@ -161,6 +161,7 @@ export async function startGateway(options: GatewayOptions): Promise<RunningGate
     tokens: services.tokens,
     clients: services.clients,
     tools: (options.tools ?? gatewayTools)(services),
+    hosts: config.hosts,
     logger,
   });
   const router = createRouter([...oauthRoutes({ ...services, publicUrl: config.publicUrl, hosts: config.hosts }), mcp.route], logger);
