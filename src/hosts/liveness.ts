@@ -15,6 +15,8 @@ export const MAX_LIVENESS_READS = 100;
 export const MAX_LIVENESS_IDS = 20;
 /** Timeline items read from the end of each thread; activity older than the tail falls back to the run start. */
 export const LIVENESS_TAIL = 40;
+/** Items read back before the tail, at most, to reach the start of the current run. */
+export const LIVENESS_RUN_SCAN = 500;
 const TAIL_PAGES = 3;
 const CONCURRENCY = 4;
 const MAX_SNAPSHOTS = 32;
