@@ -435,7 +435,7 @@ export class T3Client {
     return this.callTool('t3_thread_list', withoutNulls(input), threadListSchema, { readOnly: true });
   }
 
-  listThreadCatalogPage(input: { projectId: string; includeSubagents: boolean; limit: number; cursor: number }) {
+  listThreadCatalogPage(input: { projectId: string; includeSubagents: boolean; settled?: boolean; limit: number; cursor: number }) {
     return this.callTool('t3_thread_list', input, threadCatalogPageSchema, { readOnly: true });
   }
 

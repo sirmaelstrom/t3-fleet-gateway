@@ -4,6 +4,7 @@ import { startDashboard, type RunningDashboard } from './dashboard/server.ts';
 import { openDataDir } from './dataDir.ts';
 import { openDatabase, type Database } from './db/database.ts';
 import { ThreadCatalog } from './hosts/threads.ts';
+import { LivenessReader } from './hosts/liveness.ts';
 import { threadTools } from './mcp/threadTools.ts';
 import { CatalogService } from './hosts/catalog.ts';
 import { CredentialAlerts } from './hosts/alerts.ts';
@@ -46,6 +47,8 @@ export interface GatewayServices {
   /** Per-host T3 project and model catalogs for agents (opt-in per host). */
   catalog: CatalogService;
   threads: ThreadCatalog;
+  /** Read-only thread liveness (fleet_thread_liveness), delegated children included. */
+  liveness: LivenessReader;
   jobs: JobService;
   webhooks: WebhookStore;
   close(): Promise<void>;
@@ -100,6 +103,7 @@ export function openServices(options: ServiceOptions): GatewayServices {
     registry,
     catalog,
     threads: new ThreadCatalog(registry, clock, logger),
+    liveness: new LivenessReader(registry, clock, logger),
     webhooks,
     jobs: new JobService({ config, store: new JobStore(db, clock, logger, webhooks), registry, catalog, clock, logger }),
     async close() {

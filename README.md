@@ -310,9 +310,10 @@ When you've reviewed a job, the bot can `work_settle` it, which parks the T3 thr
 | Follow up, answer questions or interrupt | `work_continue`, `work_respond`, `work_cancel` |
 | Settle a quiet thread after review | `work_settle` |
 | Find and adopt threads started in T3 | `fleet_threads`, `work_adopt` |
+| See which threads are working, waiting or quiet, children included, without adopting them | `fleet_thread_liveness` |
 | Manage its own notifications | `work_notifications`, `work_subscribe`, `work_replay` |
 
-`fleet_projects`, `fleet_models` and `fleet_threads` need discovery on the host; the thread tools also need the thread scopes. Schemas and limits: [design reference](docs/design.md#tools).
+`fleet_projects`, `fleet_models`, `fleet_threads` and `fleet_thread_liveness` need discovery on the host; the thread tools also need the thread scopes. Schemas and limits: [design reference](docs/design.md#tools).
 
 ## Configuration: choose what to enable
 
