@@ -6,6 +6,7 @@ import type { Snapshot } from '../hosts/catalog.ts';
 import { GatewayError } from '../errors.ts';
 import { permits, READ_SCOPE, THREAD_READ_SCOPE } from '../oauth/scopes.ts';
 import { isoTime } from '../time.ts';
+import { MAX_LIVENESS_IDS, MAX_LIVENESS_READS } from '../hosts/liveness.ts';
 import { defineTool } from './tools.ts';
 
 export function threadTools(deps: GatewayServices) {
@@ -60,6 +61,54 @@ export function threadTools(deps: GatewayServices) {
       return { structured, summary: `${structured.total} T3 thread(s); read ${structured.readAt}.` +
         threads.map((thread) => `\n${thread.threadId} [${thread.state}${thread.origin ? `, ${thread.origin}, job ${thread.jobId}` : ', external'}] ${JSON.stringify(thread.title)}`).join('') +
         (nextCursor ? `\nMore: cursor ${nextCursor}` : '') };
+    },
+  }), defineTool({
+    name: 'fleet_thread_liveness', title: 'Read T3 thread liveness', scope: READ_SCOPE, readOnly: true,
+    description: 'Whether each live thread in one T3 project is working, waiting (on a question, an approval, an unclassified request ' +
+      'or a delegated child), has ended its turn, or is idle, with its own last provider activity. Requires threads:read plus Read on ' +
+      'the host, and discovery.enabled. Covers non-settled threads including delegated children and threads started directly in T3; ' +
+      'a thread is read in detail when it is active or waiting, its latest change is within withinHours (default 24), or it is named in ' +
+      `threadIds (at most ${MAX_LIVENESS_IDS}; for example a tracked thread that has since been settled). At most ${MAX_LIVENESS_READS} ` +
+      'detailed reads; beyond that, or when a page or thread cannot be read, complete is false and errors say why: never read an ' +
+      'incomplete report as "nothing running". lastActivityAt is the newest own-thread provider activity (output, reasoning, commands, ' +
+      'tools, file changes) in the active or latest run, else that run\'s start; it never includes metadata changes, user messages or ' +
+      'this read. Returns no message text, commands or answers. Read-only: it never sends, answers, settles, adopts or watches, and ' +
+      'never marks a child result delivered. Cached for 30 seconds.',
+    inputSchema: z.object({ host: z.string().min(1).max(32), projectId: z.string().min(1).max(256),
+      threadIds: z.array(z.string().min(1).max(2048)).max(MAX_LIVENESS_IDS).optional(), withinHours: z.int().min(1).max(168).optional() }),
+    outputSchema: z.object({
+      host: z.string(), projectId: z.string(), environmentId: z.string().nullable(), readAt: z.string(), complete: z.boolean(),
+      listed: z.int(), considered: z.int(), omitted: z.int(),
+      threads: z.array(z.object({
+        threadId: responseThreadIdSchema, link: z.string().nullable(), parentThreadId: z.string().nullable(), title: z.string(),
+        status: z.string(), phase: z.enum(['working', 'waiting', 'turn_ended', 'idle']),
+        waitingOn: z.enum(['question', 'approval', 'request', 'child']).nullable(), activeRunId: z.string().nullable(),
+        latestRun: z.object({ runId: z.string(), ordinal: z.int(), status: z.string(), requestedAt: z.string().nullable(),
+          startedAt: z.string().nullable(), completedAt: z.string().nullable() }).nullable(),
+        createdAt: z.string().nullable(), metadataUpdatedAt: z.string().nullable(), observedAt: z.string(),
+        settled: z.boolean().nullable(), archived: z.boolean().nullable(), snoozedUntil: z.string().nullable(),
+        lastActivityAt: z.string().nullable(), activitySource: z.enum(['timeline', 'run_start', 'none']), activityComplete: z.boolean(),
+        openItems: z.int(), delegatedActive: z.int(), pendingQuestions: z.int(), pendingRequests: z.int(),
+        approval: z.enum(['confirmed', 'unclassified', 'none']),
+        pullRequests: z.array(z.object({ url: z.string(), repository: z.string().nullable(), number: z.int().nullable(), state: z.string().nullable() })),
+      })),
+      errors: z.array(z.object({ threadId: z.string().nullable(), code: z.string() })),
+    }),
+    async run(input, caller) {
+      if (!caller.scopes.includes(THREAD_READ_SCOPE)) throw new GatewayError('insufficient_scope', 'fleet_thread_liveness requires threads:read. Ask the operator to use clients grant.');
+      const host = deps.config.hosts.find((candidate) => candidate.id === input.host);
+      if (!host || !permits(caller.scopes, 'read', host.id)) throw new GatewayError('not_found', 'No host with that id. Use fleet_status.');
+      await deps.jobs.authorizeProject(caller, host.id, input.projectId);
+      if (!host.discovery.enabled) throw new GatewayError('discovery_disabled', 'Thread liveness needs discovery.enabled on this host.');
+      // Same discovery rules as fleet_threads, before any liveness cache or T3 thread access.
+      const projects = await deps.catalog.projects(host.id);
+      if (!projects.value.some((project) => project.id === input.projectId)) throw new GatewayError('not_found', 'No project with that id on this host.');
+      const snapshot = await deps.liveness.read(host.id, input.projectId, { threadIds: input.threadIds ?? [], withinHours: input.withinHours ?? 24 });
+      const report = snapshot.value;
+      const counts = new Map<string, number>();
+      for (const thread of report.threads) counts.set(thread.phase, (counts.get(thread.phase) ?? 0) + 1);
+      return { structured: report, summary: `${report.threads.length} thread(s) read of ${report.considered} considered, ${report.listed} non-settled; ` +
+        `${[...counts].map(([phase, n]) => `${n} ${phase}`).join(', ') || 'none live'}; ${report.complete ? 'complete' : `INCOMPLETE (${report.errors.map((e) => e.code).join(', ')})`}; read ${report.readAt}.` };
     },
   })];
 }

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **`fleet_thread_liveness`**, a read-only tool for dashboards: for one project's non-settled threads, delegated children and threads started in T3 included, it says whether each is working, waiting (on a question, an approval, an unclassified request or a child), has ended its turn, or is idle, with the thread's own last provider activity (never metadata changes or the read itself). It needs Read on the host, `threads:read` and discovery, reads only the end of each timeline without message text, never adopts, sends or marks a child result delivered, and reports `complete: false` with error codes instead of a partial "nothing running".
+
 ## 0.3.0 (2026-10-31)
 
 ### Upgrading
