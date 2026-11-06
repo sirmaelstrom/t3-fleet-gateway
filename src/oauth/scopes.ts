@@ -109,6 +109,21 @@ export function permittedHosts(scopes: readonly string[], level: AccessLevel): '
 }
 
 /**
+ * The scopes a caller holds on the configured hosts. A host with `fleetScopes: false` is outside the fleet scopes:
+ * while one is configured, each fleet scope stands for the host scopes of the hosts that still accept fleet scopes,
+ * so only an explicit `host:<id>:*` grant reaches an opted-out host. Without one the scopes are returned as they are,
+ * so a fleet grant keeps covering every host, including hosts added later.
+ */
+export function scopesOnHosts(scopes: readonly Scope[], hosts: readonly { id: string; fleetScopes: boolean }[]): Scope[] {
+  if (hosts.every((host) => host.fleetScopes)) return [...scopes];
+  const fleetHosts = hosts.filter((host) => host.fleetScopes).map((host) => host.id);
+  return canonical(scopes.flatMap((scope) => {
+    const level = fleetLevel(scope);
+    return level === undefined ? [scope] : fleetHosts.map((hostId) => hostScope(hostId, level));
+  }));
+}
+
+/**
  * The scopes a refresh keeps when the client names `scope` (RFC 6749 section 6): never more than the grant.
  * Each requested scope must be one the grant holds, except that a fleet scope requested of a grant restricted
  * to selected hosts stands for that grant's host scopes at the same level (clients that only know the advertised
