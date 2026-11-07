@@ -13,8 +13,14 @@ import { cleanThreadTitle, MAX_THREAD_PAGES, THREAD_PAGE_SIZE } from './threads.
 export const MAX_LIVENESS_READS = 100;
 /** Thread ids a caller may name for a direct read (for example a tracked thread that left the non-settled list). */
 export const MAX_LIVENESS_IDS = 20;
-/** Timeline items read from the end of each thread; activity older than the tail falls back to the run start. */
+/** Timeline items read from the end of each thread first. */
 export const LIVENESS_TAIL = 40;
+/**
+ * Items read back before the tail, at most, until the read reaches the start of the current run (an item of an older run,
+ * or the timeline's start): an old command updated in place belongs to the current run. Beyond this the read is partial.
+ */
+export const LIVENESS_RUN_SCAN = 500;
+const SCAN_PAGE = 100;
 const TAIL_PAGES = 3;
 const CONCURRENCY = 4;
 const MAX_SNAPSHOTS = 32;
@@ -65,11 +71,15 @@ export interface ThreadLiveness {
   /** Newest own-thread provider activity in the active (else latest) run, or that run's start: never metadata or observation time. */
   lastActivityAt: string | null;
   activitySource: 'timeline' | 'run_start' | 'none';
-  /** The tail reached the end of the timeline. */
+  /**
+   * The read saw everything the activity fields depend on: the timeline's end, every item of the current run, and either a
+   * complete thread list (for listed children) or the whole timeline. False: lastActivityAt, openItems and delegatedActive
+   * are lower bounds, and an ended or idle phase may hide work the read did not reach.
+   */
   activityComplete: boolean;
   /** Items of the current run still going (a long command, a streaming message): quiet is then expected. */
   openItems: number;
-  /** Delegated tasks the tail shows still going. */
+  /** Delegated tasks still going: running `subagent` items read, or listed children of this thread that are active, whichever is more. */
   delegatedActive: number;
   pendingQuestions: number;
   pendingRequests: number;
@@ -144,13 +154,35 @@ export function linkEnvironment(link: string | null | undefined): string | null 
   return match?.[1] ?? null;
 }
 
+/** The run whose items are the heartbeat: the active run, else the latest. */
+function heartbeatRunId(read: ThreadRead): string | null {
+  const latest = read.recentRuns.find((run) => run.runId === read.thread.latestRunId)
+    ?? [...read.recentRuns].sort((a, b) => b.ordinal - a.ordinal)[0];
+  return read.thread.activeRunId ?? read.thread.latestRunId ?? latest?.runId ?? null;
+}
+
+const ownItems = (threadId: string, items: readonly ThreadItem[]) => items.filter((item) => {
+  const source = Reflect.get(item, 'sourceThreadId');
+  return source === undefined || source === null || source === threadId;
+});
+
+/** The items reach back to the start of `runId`: an own item of an older run comes before every item of it. */
+function reachesRunStart(threadId: string, items: readonly ThreadItem[], runId: string | null): boolean {
+  if (runId === null) return true;
+  const own = ownItems(threadId, items);
+  const first = Math.min(...own.filter((item) => item.runId === runId).map((item) => item.position));
+  return own.some((item) => item.runId !== null && item.runId !== runId && item.position < first);
+}
+
 /**
- * One thread's liveness from a tail read of its activity view and its pending question count. Pure: the rules, in order:
+ * One thread's liveness from a bounded read of its activity view, its pending question count and the active children the
+ * thread list shows for it (`listedChildren`). Pure: the rules, in order:
  * a pending question waits on an answer; a confirmed pending approval waits on approval; T3 reporting `waiting` with an
  * unclassified pending request waits on that request; an active run (or active status) is working, whatever its pending
  * count; delegated work still going waits on a child; a terminal latest run ended the turn; otherwise idle.
  */
-export function deriveLiveness(read: ThreadRead, items: readonly ThreadItem[], pendingQuestions: number, complete: boolean, now: number): ThreadLiveness {
+export function deriveLiveness(read: ThreadRead, items: readonly ThreadItem[], pendingQuestions: number, complete: boolean, now: number,
+  listedChildren = 0): ThreadLiveness {
   const { thread } = read;
   const extra = threadExtra.parse(thread);
   const runs = [...read.recentRuns].sort((a, b) => b.ordinal - a.ordinal);
@@ -162,15 +194,12 @@ export function deriveLiveness(read: ThreadRead, items: readonly ThreadItem[], p
   };
   const activeRun = thread.activeRunId === null ? undefined : runs.find((run) => run.runId === thread.activeRunId);
   const latest = toRun(runs.find((run) => run.runId === thread.latestRunId) ?? runs[0]);
-  const heartbeatRunId = thread.activeRunId ?? thread.latestRunId ?? latest?.runId ?? null;
-  const own = items.filter((item) => {
-    const source = Reflect.get(item, 'sourceThreadId');
-    return source === undefined || source === null || source === thread.threadId;
-  });
-  const current = own.filter((item) => heartbeatRunId !== null && item.runId === heartbeatRunId);
+  const heartbeat = heartbeatRunId(read);
+  const own = ownItems(thread.threadId, items);
+  const current = own.filter((item) => heartbeat !== null && item.runId === heartbeat);
   const times = current.filter(isProviderActivity).map((item) => Date.parse(item.updatedAt))
     .filter((ms) => Number.isFinite(ms) && ms <= now + MAX_SKEW_MS);
-  const heartbeatRun = toRun(runs.find((run) => run.runId === heartbeatRunId));
+  const heartbeatRun = toRun(runs.find((run) => run.runId === heartbeat));
   const started = heartbeatRun?.startedAt ? Date.parse(heartbeatRun.startedAt) : NaN;
   const baseline = Number.isFinite(started) && started <= now + MAX_SKEW_MS ? started : null;
   const timeline = times.length ? Math.max(...times) : null;
@@ -180,7 +209,7 @@ export function deriveLiveness(read: ThreadRead, items: readonly ThreadItem[], p
   else if (baseline !== null) { lastActivity = baseline; activitySource = 'run_start'; }
 
   const openItems = current.filter((item) => isUnsettled(item) && !/subagent/i.test(item.type)).length;
-  const delegatedActive = own.filter(isDelegatedWorkActive).length;
+  const delegatedActive = Math.max(own.filter(isDelegatedWorkActive).length, listedChildren);
   const pendingRequests = Math.max(0, thread.pendingRequestCount);
   const unansweredOther = pendingRequests > pendingQuestions;
   const approval = !unansweredOther ? 'none' : own.some((item) => /approval/i.test(item.type) && isUnsettled(item)) ? 'confirmed' : 'unclassified';
@@ -307,6 +336,14 @@ export class LivenessReader {
       if (result.nextCursor <= cursor) { complete = false; errors.push({ threadId: null, code: 'list_shifted' }); break; }
       cursor = result.nextCursor;
     }
+    // Delegated children are listed with their parent: an active child keeps the parent waiting on it even when its
+    // `subagent` item is older than anything this read reaches. Only a complete list can say a parent has none.
+    const listComplete = complete;
+    const activeChildren = new Map<string, number>();
+    for (const row of rows.values()) {
+      if (!row.parentThreadId || row.settled === true || row.archived === true || !ACTIVE_RUN_STATUSES.includes(row.status)) continue;
+      activeChildren.set(row.parentThreadId, (activeChildren.get(row.parentThreadId) ?? 0) + 1);
+    }
     const now = this.#clock();
     const since = now - withinHours * HOUR;
     const qualifying = [...rows.values()].filter((row) => qualifies(row, since))
@@ -325,8 +362,8 @@ export class LivenessReader {
       while (next < work.length) {
         const job = work[next++]!;
         try {
-          const result = await this.#thread(host, project, job.threadId, job.itemCount);
-          if (!result.activityComplete) complete = false;
+          const result = await this.#thread(host, project, job.threadId, job.itemCount, activeChildren.get(job.threadId) ?? 0, listComplete);
+          if (!result.activityComplete) { complete = false; errors.push({ threadId: job.threadId, code: 'activity_partial' }); }
           threads.push(result);
         } catch (error) {
           complete = false;
@@ -345,7 +382,12 @@ export class LivenessReader {
       listed: rows.size, considered, omitted, threads, errors: errors.slice(0, 50) };
   }
 
-  async #thread(host: string, project: string, threadId: string, itemCount: number | undefined): Promise<ThreadLiveness> {
+  /**
+   * One thread, bounded: the last LIVENESS_TAIL items, then back at most LIVENESS_RUN_SCAN more until the read reaches the
+   * current run's start. Never the whole history of a long run: what it cannot reach makes `activityComplete` false.
+   */
+  async #thread(host: string, project: string, threadId: string, itemCount: number | undefined, listedChildren: number,
+    listComplete: boolean): Promise<ThreadLiveness> {
     const client = this.#registry.client(host);
     const base = { threadId, view: 'activity' as const, runLimit: 5, maxCharsPerItem: 1 };
     let count = itemCount;
@@ -358,6 +400,7 @@ export class LivenessReader {
     }
     const items: ThreadItem[] = [];
     let after = count !== undefined && count > LIVENESS_TAIL ? count - LIVENESS_TAIL - 1 : null;
+    let low = after === null ? 0 : after + 1;
     let completeTail = false;
     for (let page = 0; page < TAIL_PAGES; page++) {
       read = await client.readThread({ ...base, afterPosition: after, limit: 100 });
@@ -368,8 +411,21 @@ export class LivenessReader {
       after = read.nextPosition;
     }
     const detail = read!;
+    const runId = heartbeatRunId(detail);
+    let runStart = low <= 0 || reachesRunStart(threadId, items, runId);
+    for (let scanned = 0; !runStart && scanned < LIVENESS_RUN_SCAN;) {
+      const size = Math.min(SCAN_PAGE, LIVENESS_RUN_SCAN - scanned, low);
+      const page = await client.readThread({ ...base, afterPosition: low - size - 1 < 0 ? null : low - size - 1, limit: size });
+      if (page.thread.projectId !== project) throw new GatewayError('not_found', 'That thread is not in this project.');
+      items.unshift(...page.items.filter((item) => item.position < low));
+      scanned += size;
+      low -= size;
+      runStart = low <= 0 || reachesRunStart(threadId, items, runId);
+    }
+    // Without a complete list, only the whole timeline can show that no old delegated child is still running.
+    const delegation = listComplete || low <= 0;
     const waitingStatus = detail.thread.status === 'waiting';
     const questions = detail.thread.pendingRequestCount > 0 || waitingStatus ? (await client.listPendingRequests(threadId)).length : 0;
-    return deriveLiveness(detail, items, questions, completeTail, this.#clock());
+    return deriveLiveness(detail, items, questions, completeTail && runStart && delegation, this.#clock(), listedChildren);
   }
 }

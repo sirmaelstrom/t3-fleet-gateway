@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { deriveLiveness, linkEnvironment, LIVENESS_TAIL } from '../src/hosts/liveness.ts';
+import { deriveLiveness, linkEnvironment, LIVENESS_RUN_SCAN, LIVENESS_TAIL } from '../src/hosts/liveness.ts';
 import { changeThreadScopes } from '../src/oauth/threadScopes.ts';
 import { THREAD_READ_SCOPE } from '../src/oauth/scopes.ts';
 import { threadReadSchema, type ThreadRead } from '../src/t3/schemas.ts';
@@ -168,17 +168,20 @@ test('the heartbeat is own provider activity in the current run: not metadata, u
   assert.equal(byId(report, id)?.activitySource, 'timeline');
 });
 
-test('long timelines are read from the tail only, and a failed thread read is explicit without hiding the others', async (t) => {
+test('long timelines whose current run fits the tail are read from the tail only, and a failed thread read is explicit without hiding the others', async (t) => {
   const h = await harness(t);
   grantRead(h);
   const long = external(h, 'Synthetic long thread');
   h.fake.addActivity(long, 'dynamic_tool', 500);
+  h.fake.endTurn(long);
+  h.fake.userTurn(long, 'Synthetic follow-up');
+  h.fake.addActivity(long, 'reasoning', 3);
   const broken = external(h, 'Synthetic unreadable');
   h.fake.readFailures.set(broken, { code: 'orchestration_error', message: 'Synthetic failure' });
   const report = await h.agent.call<Report>('fleet_thread_liveness', target);
   const tail = h.fake.reads.filter((read) => read.threadId === long);
-  assert.equal(tail.length, 1);
-  assert.equal(tail[0]!.afterPosition, 501 - LIVENESS_TAIL - 1);
+  assert.equal(tail.length, 1, 'an older run inside the tail shows where the current run starts');
+  assert.equal(tail[0]!.afterPosition, h.fake.threads.get(long)!.items.length - LIVENESS_TAIL - 1);
   assert.equal(tail[0]!.maxCharsPerItem, 1, 'no message or command text is read');
   assert.equal(byId(report, long)?.activityComplete, true);
   assert.equal(byId(report, broken), undefined);
@@ -189,6 +192,64 @@ test('long timelines are read from the tail only, and a failed thread read is ex
   assert.equal(h.fake.calls.length, calls, 'a repeat within 30 seconds is served from the cache');
   const text = JSON.stringify(report);
   assert.equal(text.includes('Synthetic external task'), false, 'no message text in the report');
+});
+
+test('an old child still running past the 40-item tail keeps its parent waiting on it', async (t) => {
+  const h = await harness(t);
+  grantRead(h);
+  // A coordinator delegates, works on for more than a tail's worth of items, then ends its turn while the child works.
+  const parent = external(h, 'Synthetic old coordinator');
+  const { childThreadId } = h.fake.delegate(parent, 'Synthetic long child');
+  h.fake.addActivity(parent, 'dynamic_tool', LIVENESS_TAIL + 5);
+  h.fake.endTurn(parent);
+  const report = await h.agent.call<Report>('fleet_thread_liveness', target);
+  const coordinator = byId(report, parent)!;
+  assert.deepEqual([coordinator.phase, coordinator.waitingOn, coordinator.delegatedActive], ['waiting', 'child', 1],
+    'an old delegated child still running is not an ended turn');
+  assert.equal(coordinator.activityComplete, true);
+  assert.equal(byId(report, childThreadId)?.phase, 'working');
+  assert.equal(report.complete, true);
+});
+
+test('an old command updated in place past the 40-item tail is activity and still open', async (t) => {
+  const h = await harness(t);
+  grantRead(h);
+  // A worker starts a long command, does more than a tail's worth of other work, then the command updates in place.
+  const worker = external(h, 'Synthetic old command');
+  const thread = h.fake.threads.get(worker)!;
+  const [command] = h.fake.addActivity(worker, 'command_execution', 1, 'running');
+  h.fake.addActivity(worker, 'reasoning', LIVENESS_TAIL + 5);
+  const old = new Date(Date.now() - 40 * 60_000).toISOString();
+  const recent = new Date(Date.now() - 5 * 60_000).toISOString();
+  for (const entry of thread.items) entry.updatedAt = old;
+  thread.runs[0]!.startedAt = old;
+  command!.updatedAt = recent;
+  const report = await h.agent.call<Report>('fleet_thread_liveness', target);
+  const busy = byId(report, worker)!;
+  assert.equal(busy.lastActivityAt, recent, 'an old command updated in place is activity');
+  assert.equal(busy.openItems, 1, 'the old command still running is an open item');
+  assert.equal(busy.activityComplete, true);
+  assert.equal(report.complete, true);
+});
+
+test('a current run longer than the bounded read is partial, never complete, and a listed child still counts', async (t) => {
+  const h = await harness(t);
+  grantRead(h);
+  const parent = external(h, 'Synthetic very long coordinator');
+  h.fake.delegate(parent, 'Synthetic child behind a long run');
+  h.fake.addActivity(parent, 'dynamic_tool', 2000);
+  h.fake.endTurn(parent);
+  const report = await h.agent.call<Report>('fleet_thread_liveness', target);
+  const coordinator = byId(report, parent)!;
+  assert.equal(coordinator.activityComplete, false, 'history the read could not reach is not labelled complete');
+  assert.deepEqual([coordinator.phase, coordinator.waitingOn], ['waiting', 'child'], 'the listed child shows the wait without the old item');
+  assert.equal(report.complete, false);
+  assert.deepEqual(report.errors.filter((error) => error.threadId === parent).map((error) => error.code), ['activity_partial']);
+  const reads = h.fake.reads.filter((entry) => entry.threadId === parent);
+  assert.ok(reads.length <= 1 + 3 + LIVENESS_RUN_SCAN / 100, `bounded reads: ${reads.length}`);
+  const lowest = Math.min(...reads.map((entry) => entry.afterPosition ?? -1));
+  const count = h.fake.threads.get(parent)!.items.length;
+  assert.equal(lowest, count - LIVENESS_TAIL - LIVENESS_RUN_SCAN - 1, `no full-history scan: read from position ${lowest} of ${count}`);
 });
 
 function read(overrides: { thread?: Record<string, unknown>; runs?: Record<string, unknown>[]; items?: Record<string, unknown>[] } = {}): ThreadRead {

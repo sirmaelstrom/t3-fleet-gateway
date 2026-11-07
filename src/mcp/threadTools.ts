@@ -72,7 +72,8 @@ export function threadTools(deps: GatewayServices) {
       'detailed reads; beyond that, or when a page or thread cannot be read, complete is false and errors say why: never read an ' +
       'incomplete report as "nothing running". lastActivityAt is the newest own-thread provider activity (output, reasoning, commands, ' +
       'tools, file changes) in the active or latest run, else that run\'s start; it never includes metadata changes, user messages or ' +
-      'this read. Returns no message text, commands or answers. Read-only: it never sends, answers, settles, adopts or watches, and ' +
+      'this read. activityComplete false (error activity_partial) means the bounded read could not see the whole current run or every delegated child, so ' +
+      'lastActivityAt, openItems and delegatedActive are lower bounds and an ended or idle phase is not final. Returns no message text, commands or answers. Read-only: it never sends, answers, settles, adopts or watches, and ' +
       'never marks a child result delivered. Cached for 30 seconds.',
     inputSchema: z.object({ host: z.string().min(1).max(32), projectId: z.string().min(1).max(256),
       threadIds: z.array(z.string().min(1).max(2048)).max(MAX_LIVENESS_IDS).optional(), withinHours: z.int().min(1).max(168).optional() }),
