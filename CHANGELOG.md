@@ -3,6 +3,7 @@
 ## Unreleased
 
 - **`fleet_thread_liveness`**, a read-only tool for dashboards: for one project's non-settled threads, delegated children and threads started in T3 included, it says whether each is working, waiting (on a question, an approval, an unclassified request or a child), has ended its turn, or is idle, with the thread's own last provider activity (never metadata changes or the read itself). It needs Read on the host, `threads:read` and discovery, reads only the end of each timeline without message text, never adopts, sends or marks a child result delivered, and reports `complete: false` with error codes instead of a partial "nothing running".
+- **`fleet_thread_liveness` sees past its 40-item tail.** A coordinator whose delegated child is still running after more than 40 newer items no longer reports `turn_ended`: active children in the thread list count in `delegatedActive`. An old command updated in place counts as activity: the read goes back (at most 500 items) to the start of the current run. A run longer than that, or a parent whose list was incomplete, is `activityComplete: false` with `activity_partial`, never complete.
 
 ## 0.3.0 (2026-10-31)
 
