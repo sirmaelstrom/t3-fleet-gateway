@@ -136,6 +136,9 @@ export interface FakeThread {
   launch: Record<string, unknown>;
   /** A scratch thread's own folder, which T3 creates for it; null for a thread in a project's root or worktree. */
   scratchFolder: string | null;
+  /** The model and provider instance T3 shows on the thread's row (`t3_thread_list`) and in its read; a launch's model selection sets them. */
+  model: string;
+  providerInstanceId: string;
 }
 
 /** Made-up environment id, used in thread links the way T3 builds them. */
@@ -278,6 +281,8 @@ export class FakeT3 {
   readonly statusOnce = new Map<string, number>();
   /** Threads whose t3_thread_read answers in a shape that does not match T3's schema. */
   readonly brokenReads = new Set<string>();
+  /** Fields merged over a thread's summary, in both its list row and its read (an `undefined` value drops the field): a row T3 shapes differently. */
+  readonly threadRowOverrides = new Map<string, Record<string, unknown>>();
   /** Synthetic older/malformed detail fields, applied before the MCP result is serialized. */
   readonly threadDetailOverrides = new Map<string, Record<string, unknown>>();
   /** Thread id to a T3 failure returned by t3_thread_read for that thread only. */
@@ -1049,6 +1054,8 @@ export class FakeT3 {
       updatedAt: now,
       launch: input,
       scratchFolder: input.scratch ? `/synthetic/scratch/${threadId}` : null,
+      model: typeof input.modelSelection?.model === 'string' ? input.modelSelection.model : 'synthetic-model',
+      providerInstanceId: typeof input.modelSelection?.instanceId === 'string' ? input.modelSelection.instanceId : 'synthetic-provider',
     };
     this.threads.set(threadId, thread);
     let run: FakeRun | undefined;
@@ -1096,8 +1103,8 @@ export class FakeT3 {
       creationSource: 'mcp',
       status: thread.status,
       latestRunId: thread.runs.at(-1)?.runId ?? null,
-      providerInstanceId: 'synthetic-provider',
-      model: 'synthetic-model',
+      providerInstanceId: thread.providerInstanceId,
+      model: thread.model,
       runtimeMode: thread.runtimeMode,
       interactionMode: 'default',
       linkedPullRequest: null,
@@ -1111,6 +1118,7 @@ export class FakeT3 {
       itemCount: thread.items.length,
       createdAt: thread.createdAt,
       updatedAt: thread.updatedAt,
+      ...this.threadRowOverrides.get(thread.threadId),
     };
   }
 

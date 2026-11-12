@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
+import { changeThreadScopes } from '../src/oauth/threadScopes.ts';
+import { THREAD_READ_SCOPE } from '../src/oauth/scopes.ts';
 import { HOUR } from '../src/time.ts';
 import { TestAgentProvider } from './helpers/agent.ts';
 import { startFakeT3 } from './helpers/fakeT3.ts';
@@ -162,6 +164,20 @@ test('no T3 project name, model, option or constraint from discovery ever appear
   assertNotLogged(gw, [...Object.values(content), 'Synthetic-wrong-value']);
   const events = JSON.stringify(gw.services.db.prepare('SELECT * FROM job_events').all());
   for (const value of [...Object.values(content), 'Synthetic-wrong-value-1c9e']) assert.equal(events.includes(value), false, 'content leaked into events');
+});
+
+test('a thread\'s model and provider in the liveness report never reach the logs, even when a read fails', async (t) => {
+  const { gw, agent, fake } = await startJobHarness(t, { host: { discovery: { enabled: true } } });
+  changeThreadScopes(gw.services.db, gw.clock, agent.clientId, 'grant', [THREAD_READ_SCOPE]);
+  const content = { model: 'synthetic-liveness-model-5d1e', provider: 'synthetic-liveness-provider-b39c' };
+  const launch = (title: string) => fake.launchDirect({ projectId: 'project-1', title, runtimeMode: 'auto', message: 'Synthetic task',
+    modelSelection: { instanceId: content.provider, model: content.model } }).threadId;
+  launch('Synthetic readable');
+  fake.readFailures.set(launch('Synthetic unreadable'), { code: 'orchestration_error', message: `Synthetic failure ${content.model}` });
+  const report = await agent.call<{ threads: { model: string | null; provider: string | null }[]; errors: unknown[] }>('fleet_thread_liveness', { host: 'main', projectId: 'project-1' });
+  assert.deepEqual(report.threads.map((thread) => [thread.model, thread.provider]), [[content.model, content.provider]], 'authorized output carries them');
+  assert.ok(report.errors.length > 0, 'the failing read was exercised');
+  assertNotLogged(gw, Object.values(content));
 });
 
 test('scratch work leaks no task, title, T3 project name or catalog content through drift, a lost launch or a refused replay', async (t) => {
