@@ -73,7 +73,7 @@ export function threadTools(deps: GatewayServices) {
       'incomplete report as "nothing running". lastActivityAt is the newest own-thread provider activity (output, reasoning, commands, ' +
       'tools, file changes) in the active or latest run, else that run\'s start; it never includes metadata changes, user messages or ' +
       'this read. activityComplete false (error activity_partial) means the bounded read could not see the whole current run or every delegated child, so ' +
-      'lastActivityAt, openItems and delegatedActive are lower bounds and an ended or idle phase is not final. Returns no message text, commands or answers. Read-only: it never sends, answers, settles, adopts or watches, and ' +
+      'lastActivityAt, openItems and delegatedActive are lower bounds and an ended or idle phase is not final. model and provider are the thread\'s model id and provider instance as T3 shows them (null when T3 gives none). Returns no message text, commands or answers. Read-only: it never sends, answers, settles, adopts or watches, and ' +
       'never marks a child result delivered. Cached for 30 seconds.',
     inputSchema: z.object({ host: z.string().min(1).max(32), projectId: z.string().min(1).max(256),
       threadIds: z.array(z.string().min(1).max(2048)).max(MAX_LIVENESS_IDS).optional(), withinHours: z.int().min(1).max(168).optional() }),
@@ -92,6 +92,7 @@ export function threadTools(deps: GatewayServices) {
         openItems: z.int(), delegatedActive: z.int(), pendingQuestions: z.int(), pendingRequests: z.int(),
         approval: z.enum(['confirmed', 'unclassified', 'none']),
         pullRequests: z.array(z.object({ url: z.string(), repository: z.string().nullable(), number: z.int().nullable(), state: z.string().nullable() })),
+        model: z.string().nullable(), provider: z.string().nullable(),
       })),
       errors: z.array(z.object({ threadId: z.string().nullable(), code: z.string() })),
     }),

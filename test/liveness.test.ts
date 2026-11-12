@@ -15,6 +15,7 @@ interface Liveness {
   latestRun: { runId: string; status: string; startedAt: string | null } | null;
   lastActivityAt: string | null; activitySource: string; activityComplete: boolean; openItems: number; delegatedActive: number;
   pendingQuestions: number; pendingRequests: number; approval: string; metadataUpdatedAt: string | null; settled: boolean | null;
+  model: string | null; provider: string | null;
 }
 interface Report { complete: boolean; listed: number; considered: number; omitted: number; environmentId: string | null; readAt: string; threads: Liveness[]; errors: { threadId: string | null; code: string }[] }
 
@@ -250,6 +251,51 @@ test('a current run longer than the bounded read is partial, never complete, and
   const lowest = Math.min(...reads.map((entry) => entry.afterPosition ?? -1));
   const count = h.fake.threads.get(parent)!.items.length;
   assert.equal(lowest, count - LIVENESS_TAIL - LIVENESS_RUN_SCAN - 1, `no full-history scan: read from position ${lowest} of ${count}`);
+});
+
+test('liveness reports each thread\'s model and provider from its row: present, absent, invalid and bounded', async (t) => {
+  const h = await harness(t);
+  grantRead(h);
+  const chosen = h.fake.launchDirect({ projectId: 'project-1', title: 'Synthetic chosen model', runtimeMode: 'auto', message: 'Synthetic task',
+    modelSelection: { instanceId: 'synthetic-provider-b', model: 'synthetic-model-b' } }).threadId;
+  const defaulted = external(h, 'Synthetic default model');
+  const absent = external(h, 'Synthetic no model');
+  const invalid = external(h, 'Synthetic invalid model');
+  const long = external(h, 'Synthetic long model');
+  const fallback = external(h, 'Synthetic read-only model');
+  h.fake.threadRowOverrides.set(absent, { model: undefined, providerInstanceId: undefined });
+  h.fake.threadRowOverrides.set(invalid, { model: 42, providerInstanceId: '' });
+  h.fake.threadRowOverrides.set(long, { model: 'm'.repeat(201), providerInstanceId: 'bad\nprovider' });
+  h.fake.threadRowOverrides.set(fallback, { model: null, providerInstanceId: undefined });
+  h.fake.threadDetailOverrides.set(fallback, { model: 'synthetic-model-detail', providerInstanceId: 'synthetic-provider-detail' });
+  const report = await h.agent.call<Report>('fleet_thread_liveness', target);
+  assert.equal(report.complete, true, 'an odd model field never drops a row or makes the report partial');
+  assert.deepEqual(report.errors, []);
+  const pair = (id: string) => [byId(report, id)?.model, byId(report, id)?.provider];
+  assert.deepEqual(pair(chosen), ['synthetic-model-b', 'synthetic-provider-b']);
+  assert.deepEqual(pair(defaulted), ['synthetic-model', 'synthetic-provider']);
+  for (const id of [absent, invalid, long]) assert.deepEqual(pair(id), [null, null], 'absent or invalid is null');
+  assert.deepEqual(pair(fallback), ['synthetic-model-detail', 'synthetic-provider-detail'], 'a row without a usable value falls back to the thread read');
+  for (const id of [absent, invalid, long]) {
+    const thread = byId(report, id)!;
+    assert.ok('model' in thread && 'provider' in thread, 'the fields are always present, null rather than missing');
+    assert.ok(thread.phase, 'the rest of the report is unchanged');
+  }
+});
+
+test('derive: model and provider come from the list row, else the thread read, as bounded strings', () => {
+  const pair = (live: ReturnType<typeof deriveLiveness>) => [live.model, live.provider];
+  const a = read({ thread: { model: 'synthetic-model-read', providerInstanceId: 'synthetic-provider-read' } });
+  assert.deepEqual(pair(deriveLiveness(a, [], 0, true, NOW)), ['synthetic-model-read', 'synthetic-provider-read']);
+  const row = { model: 'synthetic-model-row', providerInstanceId: 'synthetic-provider-row' };
+  assert.deepEqual(pair(deriveLiveness(a, [], 0, true, NOW, 0, row)), ['synthetic-model-row', 'synthetic-provider-row'], 'the row wins');
+  assert.deepEqual(pair(deriveLiveness(a, [], 0, true, NOW, 0, { model: '   ', providerInstanceId: { id: 'x' } })),
+    ['synthetic-model-read', 'synthetic-provider-read'], 'blank or non-string row values fall back');
+  assert.deepEqual(pair(deriveLiveness(read(), [], 0, true, NOW)), [null, null]);
+  assert.deepEqual(pair(deriveLiveness(read(), [], 0, true, NOW, 0, { model: 'm'.repeat(200), providerInstanceId: 'p'.repeat(201) })),
+    ['m'.repeat(200), null], '200 characters fit, 201 do not');
+  assert.deepEqual(pair(deriveLiveness(read(), [], 0, true, NOW, 0, { model: '  synthetic-model-pad  ', providerInstanceId: 'p\u0000q' })),
+    ['synthetic-model-pad', null], 'whitespace is trimmed; control characters are refused');
 });
 
 function read(overrides: { thread?: Record<string, unknown>; runs?: Record<string, unknown>[]; items?: Record<string, unknown>[] } = {}): ThreadRead {
