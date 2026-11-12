@@ -85,6 +85,10 @@ export interface ThreadLiveness {
   pendingRequests: number;
   approval: 'confirmed' | 'unclassified' | 'none';
   pullRequests: { url: string; repository: string | null; number: number | null; state: string | null }[];
+  /** The model T3 shows on the thread (its list row, else its read); null when T3 gives none or an unusable one. Never logged. */
+  model: string | null;
+  /** The provider instance T3 shows on the thread (`providerInstanceId`), under the same rules as `model`. */
+  provider: string | null;
 }
 
 export interface LivenessReport {
@@ -117,14 +121,29 @@ const rowSchema = z.looseObject({
   settled: z.boolean().optional(),
   archived: z.boolean().optional(),
   snoozedUntil: z.string().nullish(),
+  // Checked by `boundedId`, not here: an odd model must not turn the row into `invalid_row`.
+  model: z.unknown().optional(),
+  providerInstanceId: z.unknown().optional(),
 });
 type Row = z.infer<typeof rowSchema>;
+
+/** The longest model or provider id reported. */
+export const MAX_MODEL_ID = 200;
+/** A model or provider id as a bounded string: trimmed, 1 to MAX_MODEL_ID characters, no control characters; anything else is null. */
+export function boundedId(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const id = value.trim();
+  return id.length >= 1 && id.length <= MAX_MODEL_ID && !/\p{Cc}/u.test(id) ? id : null;
+}
+/** The fields of a T3 thread (list row or read) that name its model and provider; read loosely, validated by `boundedId`. */
+export interface ListedModel { model?: unknown; providerInstanceId?: unknown }
 
 const prSchema = z.looseObject({ url: z.string(), repository: z.string().nullish(), number: z.int().nullish(), state: z.string().nullish() });
 const runExtra = z.looseObject({ requestedAt: z.string().nullish(), startedAt: z.string().nullish() });
 const threadExtra = z.looseObject({
   parentThreadId: z.string().nullish(), itemCount: z.int().min(0).optional(), createdAt: z.string().optional(),
   snoozedUntil: z.string().nullish(), pullRequests: z.array(z.unknown()).optional(),
+  model: z.unknown().optional(), providerInstanceId: z.unknown().optional(),
 });
 
 const iso = (value: unknown): string | null => {
@@ -180,9 +199,10 @@ function reachesRunStart(threadId: string, items: readonly ThreadItem[], runId: 
  * a pending question waits on an answer; a confirmed pending approval waits on approval; T3 reporting `waiting` with an
  * unclassified pending request waits on that request; an active run (or active status) is working, whatever its pending
  * count; delegated work still going waits on a child; a terminal latest run ended the turn; otherwise idle.
+ * `listed` is the thread's list row: its model and provider win over the read's own, when usable.
  */
 export function deriveLiveness(read: ThreadRead, items: readonly ThreadItem[], pendingQuestions: number, complete: boolean, now: number,
-  listedChildren = 0): ThreadLiveness {
+  listedChildren = 0, listed: ListedModel = {}): ThreadLiveness {
   const { thread } = read;
   const extra = threadExtra.parse(thread);
   const runs = [...read.recentRuns].sort((a, b) => b.ordinal - a.ordinal);
@@ -251,6 +271,8 @@ export function deriveLiveness(read: ThreadRead, items: readonly ThreadItem[], p
     pendingRequests,
     approval,
     pullRequests: pullRequests(extra.pullRequests),
+    model: boundedId(listed.model) ?? boundedId(extra.model),
+    provider: boundedId(listed.providerInstanceId) ?? boundedId(extra.providerInstanceId),
   };
 }
 
@@ -362,7 +384,8 @@ export class LivenessReader {
       while (next < work.length) {
         const job = work[next++]!;
         try {
-          const result = await this.#thread(host, project, job.threadId, job.itemCount, activeChildren.get(job.threadId) ?? 0, listComplete);
+          const result = await this.#thread(host, project, job.threadId, job.itemCount, activeChildren.get(job.threadId) ?? 0, listComplete,
+            rows.get(job.threadId));
           if (!result.activityComplete) { complete = false; errors.push({ threadId: job.threadId, code: 'activity_partial' }); }
           threads.push(result);
         } catch (error) {
@@ -387,7 +410,7 @@ export class LivenessReader {
    * current run's start. Never the whole history of a long run: what it cannot reach makes `activityComplete` false.
    */
   async #thread(host: string, project: string, threadId: string, itemCount: number | undefined, listedChildren: number,
-    listComplete: boolean): Promise<ThreadLiveness> {
+    listComplete: boolean, listed?: ListedModel): Promise<ThreadLiveness> {
     const client = this.#registry.client(host);
     const base = { threadId, view: 'activity' as const, runLimit: 5, maxCharsPerItem: 1 };
     let count = itemCount;
@@ -426,6 +449,6 @@ export class LivenessReader {
     const delegation = listComplete || low <= 0;
     const waitingStatus = detail.thread.status === 'waiting';
     const questions = detail.thread.pendingRequestCount > 0 || waitingStatus ? (await client.listPendingRequests(threadId)).length : 0;
-    return deriveLiveness(detail, items, questions, completeTail && runStart && delegation, this.#clock(), listedChildren);
+    return deriveLiveness(detail, items, questions, completeTail && runStart && delegation, this.#clock(), listedChildren, listed);
   }
 }
